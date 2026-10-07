@@ -1972,6 +1972,203 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
     +zi-log "{error}Invalid update cooldown: expected an integer from 0 to 36500 days.{rst}"
     return 1
 } # ]]]
+# FUNCTION: .zinit-cooldown-worker [[[
+# Internal zpty guardian. Keep the group leader alive until its owner deletes
+# the PTY, including after the callback exits. HUP then kills remaining group
+# members even when Git has exited and a transport/helper ignores HUP or TERM.
+.zinit-cooldown-worker() {
+    builtin emulate -LR zsh
+    setopt extendedglob typesetsilent noshortloops pipefail nomonitor nobgnice
+    local -x LC_ALL=C
+    local scratch=$1 request item
+    integer guardian=$sysparams[pid] result=1
+    shift
+    # zpty creates a session; do not start work if that setup was unsuccessful.
+    builtin kill -0 -- -$guardian 2>/dev/null || return 1
+    builtin trap 'builtin kill -KILL -- -$guardian' HUP TERM INT
+    builtin print -r -- ready
+    builtin read -r request || return 1
+    [[ $request = start ]] || return 1
+    {
+        (
+            local -a reply=()
+            integer callback_rc=0 result_bytes=64
+            "$@" </dev/null || callback_rc=$?
+            (( ${#reply} <= 20010 )) || return 65
+            for item in "${reply[@]}"; do
+                [[ $item != *$'\0'* ]] || return 1
+                # Include separators and reserve space for the frame before
+                # writing anything. LC_ALL=C makes these byte counts.
+                (( result_bytes += ${#item} + 1, result_bytes <= 1048576 )) || return 65
+            done
+            # No eval on the receiving side. NUL framing preserves empty
+            # values, whitespace and quoting characters from the callback.
+            builtin printf '%s\0' zinit-cooldown-result-v1 "$callback_rc" \
+                "${#reply}" "${reply[@]}" end >! "$scratch/result" || return 1
+        ) |& command head -c 65537 >! "$scratch/log"
+        return $?
+    } &
+    # Waiting on a background job keeps the guardian responsive to HUP while
+    # a child is blocked. The pipeline also waits for diagnostic writers.
+    integer job=$!
+    builtin wait $job
+    result=$?
+    if (( result == 65 )); then
+        builtin print -r -- result-limit
+    elif (( result )); then
+        builtin print -r -- failed
+    else
+        builtin print -r -- complete
+    fi
+    # Do not exit and release the group ID before the owner's cleanup signal.
+    while builtin read -r request; do :; done
+    builtin kill -KILL -- -$guardian
+} # ]]]
+# FUNCTION: .zinit-cooldown-guard [[[
+# Own the callback's PTY and deadline separately from the invoking shell. Even
+# if that shell is suspended, this guardian stops the callback on time. Each
+# group leader stays alive until its owner deletes the PTY: never signal a
+# saved group ID after killing its leader, since that ID could be reused.
+.zinit-cooldown-guard() {
+    builtin emulate -LR zsh
+    setopt extendedglob typesetsilent noshortloops nomonitor nobgnice
+    local scratch=$1 budget=$2 worker=${1:t}-observation message request
+    local -a ready
+    integer guardian=$sysparams[pid] created=0 fd
+    shift 2
+    builtin kill -0 -- -$guardian 2>/dev/null || return 1
+    builtin trap '(( ! created )) || zpty -d "$worker" 2>/dev/null; builtin kill -KILL -- -$guardian' HUP TERM INT
+    {
+        zpty -b "$worker" .zinit-cooldown-worker "${(q)scratch}" "${(@q)@}" || return 1
+        created=1 fd=$REPLY
+        zselect -a ready -r $fd -t 100 || return 1
+        zpty -r "$worker" message || return 1
+        [[ $message = $'ready\r\n' || $message = $'ready\n' ]] || return 1
+        builtin print -r -- ready
+        builtin read -r request || return 1
+        [[ $request = start ]] || return 1
+        zpty -w "$worker" start || return 1
+        if zselect -a ready -r $fd -t $(( budget * 100 )); then
+            zpty -r "$worker" message || message=failed
+            message=${message%$'\n'} message=${message%$'\r'}
+            [[ $message = (complete|failed|result-limit) ]] || message=failed
+        else
+            message=timeout
+        fi
+        zpty -d "$worker" 2>/dev/null
+        created=0
+        builtin print -r -- "$message"
+        while builtin read -r request; do :; done
+    } always {
+        (( ! created )) || zpty -d "$worker" 2>/dev/null
+        builtin kill -KILL -- -$guardian
+    }
+} # ]]]
+# FUNCTION: .zinit-cooldown-run [[[
+# Run one trusted internal observation callback in an isolated process group.
+# $1: budget in seconds (production uses 120); remaining args: callback + args.
+# The single deadline covers the whole callback, not each Git command/retry.
+# Native temporary-directory and PTY allocation precede that deadline and
+# depend on the OS; the ready handshake is bounded after allocation returns.
+# reply is the callback's array; REPLY contains at most 64 KiB of diagnostics.
+# Return its status, 124 on timeout, 130 on cancellation, or 1 on setup/protocol
+# failure. Supervisor failures replace reply with a held result without an ETA.
+# This is process supervision, not a sandbox for code that deliberately escapes
+# its group. Never run downloaded hooks/code in the observation callback.
+# The caller must retain durable pending state until this function succeeds;
+# a callback must not clear that uncertainty before its result is accepted.
+.zinit-cooldown-run() {
+    builtin emulate -LR zsh ${=${options[xtrace]:#off}:+-o xtrace}
+    setopt extendedglob typesetsilent warncreateglobal noshortloops localtraps
+    local -x LC_ALL=C
+    local budget=$1 scratch worker message payload tracing=$options[xtrace]
+    local -a ready fields
+    local -A metadata
+    integer created=0 cancelled=0 fd rc=0
+    reply=( deferred '' '' runtime '' )
+    REPLY=
+    (( $# >= 2 )) || return 1
+    [[ $budget = [1-9][0-9]# && ${#budget} -le 3 ]] || return 1
+    (( budget <= 120 )) || return 1
+    shift
+    # Older zpty versions can signal unrelated PTYs when deleting a worker.
+    is-at-least 5.4.1 || return 1
+    zmodload zsh/zpty && zmodload zsh/system && zmodload zsh/zselect && zmodload zsh/stat || return 1
+    scratch=$(command mktemp -d "${TMPDIR:-/tmp}/zinit-cooldown-run.XXXXXXXX") || return 1
+    worker=${scratch:t}
+    {
+        () {
+            builtin trap 'cancelled=1; if (( created )); then zpty -d "$worker" 2>/dev/null; created=0; fi' HUP INT TERM
+            # zpty joins its arguments as shell code: quote each argument, including
+            # empty strings and paths. Only the fixed guardian name is executable.
+            # Inherited tracing would also be printed on the control PTY.
+            unsetopt xtrace
+            zpty -b "$worker" .zinit-cooldown-guard "${(q)scratch}" "$budget" "${(@q)@}" 2>/dev/null || return 1
+            created=1 fd=$REPLY
+            REPLY=
+            [[ $tracing = off ]] || setopt xtrace
+            # No Git runs until the ready/start handshake. This wait bounds
+            # the handshake once native PTY allocation has returned.
+            zselect -a ready -r $fd -t 100 2>/dev/null || return 1
+            zpty -r "$worker" message || return 1
+            [[ $message = $'ready\r\n' || $message = $'ready\n' ]] || return 1
+            (( ! cancelled )) || return 130
+            zpty -w "$worker" start || return 1
+            if ! zselect -a ready -r $fd -t $(( budget * 100 )) 2>/dev/null; then
+                reply=( deferred '' '' timeout '' )
+                return 124
+            fi
+            zpty -r "$worker" message || return 1
+            message=${message%$'\n'} message=${message%$'\r'}
+            if [[ $message = timeout ]]; then
+                reply=( deferred '' '' timeout '' )
+                return 124
+            fi
+            [[ -f $scratch/log && ! -L $scratch/log ]] || return 1
+            zstat -H metadata -- "$scratch/log" || return 1
+            if (( metadata[size] > 65536 )); then
+                reply=( deferred '' '' output-limit '' )
+                return 1
+            fi
+            REPLY=$(<"$scratch/log")
+            if [[ $message = result-limit ]]; then
+                reply=( deferred '' '' result-limit '' )
+                return 1
+            fi
+            [[ $message = complete && -f $scratch/result && ! -L $scratch/result ]] || return 1
+            zstat -H metadata -- "$scratch/result" || return 1
+            if (( metadata[size] > 1048576 )); then
+                reply=( deferred '' '' result-limit '' )
+                return 1
+            fi
+            payload=$(<"$scratch/result")
+            [[ $payload = *$'\0'end$'\0' ]] || return 1
+            # Remove only the framing NUL so the final empty split field cannot
+            # be confused with an empty callback value.
+            payload=${payload%$'\0'}
+            fields=( "${(@0)payload}" )
+            (( ${#fields} >= 4 && ${#fields} <= 20014 )) || return 1
+            [[ $fields[1] = zinit-cooldown-result-v1 && $fields[-1] = end &&
+                $fields[2] = (0|[1-9][0-9]#) && ${#fields[2]} -le 3 &&
+                $fields[3] = (0|[1-9][0-9]#) && ${#fields[3]} -le 5 ]] || return 1
+            (( fields[2] <= 255 && fields[3] == ${#fields} - 4 )) || return 1
+            rc=$fields[2]
+            reply=( "${(@)fields[4,-2]}" )
+            return $rc
+        } "$@" || rc=$?
+    } always {
+        # Deletion closes the PTY and signals its still-live guardian. Its HUP
+        # handler kills the owned group; do not signal a saved PID afterward.
+        (( ! created )) || zpty -d "$worker" 2>/dev/null
+        command rm -rf -- "$scratch"
+    }
+    if (( cancelled )); then
+        reply=( deferred '' '' interrupted '' )
+        REPLY=
+        return 130
+    fi
+    return $rc
+} # ]]]
 # FUNCTION: .zinit-cooldown-now [[[
 # Separate the local clock from observation storage so tests need no public
 # clock override. Neither remote dates nor file mtimes establish first-seen age.

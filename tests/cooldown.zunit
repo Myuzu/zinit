@@ -6,6 +6,145 @@
     load "${PWD}/tests/_support/cooldown_fixtures"
 }
 
+@test 'cooldown runtime preserves literal arguments, empty replies and failure status' {
+    local -a reply expected=( '' 'a; $(touch should-not-exist)' $'line\nbreak' '*' 'é' )
+    local REPLY
+    integer index
+    cooldown_runtime_fixture
+    cooldown_callback() { reply=( "$@" ); print -r -- diagnostic; return 7; }
+    cooldown_runtime_run 1 cooldown_callback "${expected[@]}"
+    assert $COOLDOWN_RUNTIME_RC equals 7
+    assert ${#reply} equals ${#expected}
+    for index in {1..5}; do
+        [[ $reply[index] = "$expected[index]" ]]
+        assert $? equals 0
+    done
+    assert "$REPLY" same_as diagnostic
+    cooldown_callback() { reply=(); }
+    cooldown_runtime_run 1 cooldown_callback
+    assert $COOLDOWN_RUNTIME_RC equals 0
+    assert ${#reply} equals 0
+    assert "$REPLY" is_empty
+}
+
+@test 'cooldown runtime holds malformed results and bounds output before serialization' {
+    local -a reply
+    local REPLY mode
+    cooldown_runtime_fixture
+    cooldown_callback() {
+        case $1 in
+            nul) reply=( $'bad\0frame' ) ;;
+            result-limit) reply=( ${(l:2097152::x:)} ) ;;
+            output-limit) print -r -- ${(l:2097152::x:)}; reply=( ready ) ;;
+        esac
+    }
+    for mode in nul result-limit output-limit; do
+        cooldown_runtime_run 1 cooldown_callback "$mode"
+        assert $COOLDOWN_RUNTIME_RC equals 1
+        assert "$reply[1]" same_as deferred
+        [[ $mode = nul ]] || assert "$reply[4]" same_as "$mode"
+        assert "$REPLY" is_empty
+    done
+}
+
+@test 'cooldown runtime shares one deadline across successive work and kills resistant children' {
+    local -a reply
+    local REPLY
+    cooldown_runtime_fixture
+    cooldown_callback() {
+        zselect -t 70 || true
+        cooldown_runtime_child "$1" wait
+    }
+    cooldown_runtime_run 1 cooldown_callback "$COOLDOWN_RUNTIME_DIR"
+    assert $COOLDOWN_RUNTIME_RC equals 124
+    assert "$reply[4]" same_as timeout
+    cooldown_runtime_gone "$(<"$COOLDOWN_RUNTIME_DIR/child")"
+    assert $? equals 0
+}
+
+@test 'cooldown runtime cleans descendants after their caller has already succeeded' {
+    local -a reply
+    local REPLY
+    cooldown_runtime_fixture
+    cooldown_runtime_run 1 cooldown_runtime_child "$COOLDOWN_RUNTIME_DIR" detach
+    assert $COOLDOWN_RUNTIME_RC equals 0
+    cooldown_runtime_gone "$(<"$COOLDOWN_RUNTIME_DIR/child")"
+    assert $? equals 0
+}
+
+@test 'cooldown runtime cancels promptly and preserves caller traps and unrelated workers' {
+    local -a reply
+    local REPLY signal launcher rc
+    cooldown_runtime_fixture
+    zpty -b observation 'read -r line; print -r -- "$line"; read -r line'
+    {
+        for signal in HUP INT TERM; do
+            command mkdir "$COOLDOWN_RUNTIME_DIR/$signal"
+            (
+                trap 'print caller > "$COOLDOWN_RUNTIME_DIR/$signal/restored"' "$signal"
+                rc=0
+                .zinit-cooldown-run 5 cooldown_runtime_child "$COOLDOWN_RUNTIME_DIR/$signal" wait || rc=$?
+                print -r -- "$rc $reply[4]" > "$COOLDOWN_RUNTIME_DIR/$signal/result"
+                builtin kill -"$signal" $sysparams[pid]
+            ) &
+            launcher=$!
+            cooldown_runtime_wait_file "$COOLDOWN_RUNTIME_DIR/$signal/child"
+            builtin kill -"$signal" $launcher
+            cooldown_runtime_wait_file "$COOLDOWN_RUNTIME_DIR/$signal/result"
+            assert "$(<"$COOLDOWN_RUNTIME_DIR/$signal/result")" same_as '130 interrupted'
+            builtin wait $launcher
+            cooldown_runtime_gone "$(<"$COOLDOWN_RUNTIME_DIR/$signal/child")"
+            assert $? equals 0
+            assert "$(<"$COOLDOWN_RUNTIME_DIR/$signal/restored")" same_as caller
+            zpty -t observation
+            assert $? equals 0
+        done
+    } always {
+        zpty -d observation
+    }
+}
+
+@test 'cooldown runtime enforces its deadline while the calling shell is suspended or killed' {
+    local -a reply
+    local REPLY signal launcher
+    cooldown_runtime_fixture
+    for signal in STOP KILL; do
+        command mkdir "$COOLDOWN_RUNTIME_DIR/$signal"
+        (
+            cooldown_runtime_run 1 cooldown_runtime_child "$COOLDOWN_RUNTIME_DIR/$signal" wait
+            print -r -- "$COOLDOWN_RUNTIME_RC $reply[4]" > "$COOLDOWN_RUNTIME_DIR/$signal/result"
+        ) &
+        launcher=$!
+        {
+            cooldown_runtime_wait_file "$COOLDOWN_RUNTIME_DIR/$signal/child"
+            builtin kill -"$signal" $launcher
+            cooldown_runtime_gone "$(<"$COOLDOWN_RUNTIME_DIR/$signal/child")"
+            assert $? equals 0
+        } always {
+            if [[ $signal = STOP ]]; then
+                builtin kill -CONT $launcher
+            fi
+            builtin wait $launcher 2>/dev/null || true
+        }
+        if [[ $signal = STOP ]]; then
+            assert "$(<"$COOLDOWN_RUNTIME_DIR/$signal/result")" same_as '124 timeout'
+        fi
+    done
+}
+
+@test 'cooldown runtime supports tracing without corrupting its control channel' {
+    local -a reply
+    local REPLY
+    cooldown_runtime_fixture
+    cooldown_callback() { reply=( ready ); }
+    setopt xtrace
+    cooldown_runtime_run 1 cooldown_callback 2> "$COOLDOWN_RUNTIME_DIR/trace"
+    assert "$options[xtrace]" same_as on
+    unsetopt xtrace
+    assert $COOLDOWN_RUNTIME_RC equals 0
+    assert "$reply[1]" same_as ready
+}
+
 @test 'observations retain reachable ages and restart removed commits on reappearance' {
     local -a reply
     local -A ages
