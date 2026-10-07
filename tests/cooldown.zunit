@@ -6,6 +6,53 @@
     load "${PWD}/tests/_support/cooldown_fixtures"
 }
 
+@test 'unavailable cooldown runtime explains the hold once without running work' {
+    local -a reply
+    local REPLY mode output original_version=$functions[is-at-least]
+    cooldown_runtime_fixture
+    cooldown_callback() { print ran > "$COOLDOWN_RUNTIME_DIR/callback"; }
+    for mode in version modules pty; do
+        ZINIT[cooldown-runtime-warning]=
+        is-at-least() { [[ $mode != version ]]; }
+        zmodload() { [[ $mode != modules ]] && builtin zmodload "$@"; }
+        zpty() { [[ $mode != pty ]] && builtin zpty "$@"; }
+        cooldown_runtime_run 1 cooldown_callback 2> "$COOLDOWN_RUNTIME_DIR/first"
+        assert $COOLDOWN_RUNTIME_RC equals 1
+        assert "$reply[4]" same_as "runtime-$mode"
+        assert "$reply[5]" is_empty
+        output=$(<"$COOLDOWN_RUNTIME_DIR/first")
+        assert "$output" contains 'Zsh 5.4.1+'
+        assert "$output" contains 'zsh/zpty'
+        assert "$output" contains 'Use -C'
+        assert "$output" contains 'update-cooldown 0'
+        cooldown_runtime_run 1 cooldown_callback 2> "$COOLDOWN_RUNTIME_DIR/second"
+        assert $COOLDOWN_RUNTIME_RC equals 1
+        assert "$(<"$COOLDOWN_RUNTIME_DIR/second")" is_empty
+        run test ! -e "$COOLDOWN_RUNTIME_DIR/callback"
+        assert $state equals 0
+    done
+    unfunction zmodload zpty
+    functions[is-at-least]=$original_version
+}
+
+@test 'cooldown limit messages name the cap and quote an explicit bypass without an ETA' {
+    local REPLY oid=${(l:40::a:)}
+    local -a reply=( deferred '' '' limit '' parents "$oid" 5001 256 )
+    .zinit-cooldown-hold-message update 'owner/plugin;echo unexpected' "${reply[@]}"
+    assert "$REPLY" contains "commit $oid has 5001 parents (limit 256)"
+    assert "$REPLY" contains 'No eligibility date.'
+    assert "$REPLY" contains 'zinit update -C owner/plugin\;echo\ unexpected'
+    assert "$reply[6]" same_as parents
+    .zinit-cooldown-hold-message self-update '' deferred '' '' limit '' introduced-commits "$oid" 10001 10000
+    assert "$REPLY" contains "ancestry check for commit $oid reached at least 10001 commits"
+    assert "$REPLY" contains 'limit 10000'
+    assert "$REPLY" contains 'zinit self-update -C'
+    .zinit-cooldown-hold-message update owner/plugin ready "$oid" '' limit '' tip-ancestry "$oid" 10001 10001
+    assert "$REPLY" contains 'newer commits held'
+    assert "$REPLY" contains 'cannot be proved'
+    assert "$REPLY" contains 'scan limit'
+}
+
 @test 'cooldown runtime preserves literal arguments, empty replies and failure status' {
     local -a reply expected=( '' 'a; $(touch should-not-exist)' $'line\nbreak' '*' 'é' )
     local REPLY
@@ -35,15 +82,22 @@
         case $1 in
             nul) reply=( $'bad\0frame' ) ;;
             result-limit) reply=( ${(l:2097152::x:)} ) ;;
+            result-count-limit) reply=( {1..20011} ) ;;
             output-limit) print -r -- ${(l:2097152::x:)}; reply=( ready ) ;;
         esac
     }
-    for mode in nul result-limit output-limit; do
+    for mode in nul result-limit result-count-limit output-limit; do
         cooldown_runtime_run 1 cooldown_callback "$mode"
         assert $COOLDOWN_RUNTIME_RC equals 1
         assert "$reply[1]" same_as deferred
         [[ $mode = nul ]] || assert "$reply[4]" same_as "$mode"
         assert "$REPLY" is_empty
+        if [[ $mode = result-count-limit ]]; then
+            .zinit-cooldown-hold-message update owner/plugin "${reply[@]}"
+            assert "$REPLY" contains '20010-value limit'
+            assert "$REPLY" contains 'No eligibility date.'
+            assert "$REPLY" contains 'zinit update -C owner/plugin'
+        fi
     done
 }
 
@@ -1106,13 +1160,15 @@ EOF
 }
 
 @test 'observed Git policy bounds unusually wide parent lists without crashing' {
-    local count index tree tip
+    local count index tree tip COOLDOWN_RUNTIME_RC
     local -a reply
     cooldown_graph_fixture
+    cooldown_callback() { cooldown_graph_select; return $COOLDOWN_GRAPH_RC; }
     tree=$(git -C "$COOLDOWN_REMOTE" rev-parse 'HEAD^{tree}')
-    for count in 1 300 1000; do
+    for count in 1 300 5001 50000; do
         # Git accepts these objects. Do not let a repeated parent pattern
-        # exhaust the shell's stack before the graph limits can hold it.
+        # exhaust the shell's stack or burn the deadline before reporting the
+        # parent cap. The largest record remains just below the total byte cap.
         tip=$({
             print -r -- "tree $tree"
             for (( index=0; index<count; ++index )); do
@@ -1126,8 +1182,8 @@ EOF
         git -C "$COOLDOWN_REMOTE" update-ref refs/heads/main "$tip"
         cooldown_graph_observe
         (( COOLDOWN_GRAPH_NOW += 864000 ))
-        cooldown_graph_select
-        assert $COOLDOWN_GRAPH_RC equals 0
+        cooldown_runtime_run 5 cooldown_callback
+        assert $COOLDOWN_RUNTIME_RC equals 0
         if (( count == 1 )); then
             assert $reply[1] same_as ready
             assert $reply[2] same_as "$tip"
@@ -1136,14 +1192,9 @@ EOF
             assert $reply[4] same_as limit
             assert "$reply[5]" is_empty
             assert $reply[7] same_as "$tip"
-            if (( count == 300 )); then
-                assert $reply[6] same_as parents
-                assert $reply[8] same_as 300
-                assert $reply[9] same_as 256
-            else
-                assert $reply[6] same_as record-bytes
-                assert $reply[9] same_as 32768
-            fi
+            assert $reply[6] same_as parents
+            assert $reply[8] same_as "$count"
+            assert $reply[9] same_as 256
         fi
     done
 }

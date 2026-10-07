@@ -1972,6 +1972,82 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
     +zi-log "{error}Invalid update cooldown: expected an integer from 0 to 36500 days.{rst}"
     return 1
 } # ]]]
+# FUNCTION: .zinit-cooldown-runtime-warning [[[
+# Explain unavailable supervision once in the invoking shell. Bulk updates
+# should check capabilities in their parent before starting parallel workers,
+# so those workers inherit the warning flag. Never silently bypass cooldown.
+.zinit-cooldown-runtime-warning() {
+    builtin emulate -LR zsh
+    local REPLY detail
+    [[ -z ${ZINIT[cooldown-runtime-warning]} ]] || return 0
+    case $1 in
+        runtime-version) detail='Zsh is too old.' ;;
+        runtime-modules) detail='A required Zsh module is unavailable.' ;;
+        runtime-pty) detail='A PTY worker could not be allocated or started.' ;;
+        *) return 1 ;;
+    esac
+    ZINIT[cooldown-runtime-warning]=1
+    +zi-log "{warn}Git cooldown is unavailable: $detail Cooldown needs Zsh 5.4.1+ with zsh/zpty," \
+        "zsh/system, zsh/zselect, zsh/stat and available PTYs. Updates remain held.{rst}" >&2
+    +zi-log "{warn}Use -C for an intentional bypass, or configure update-cooldown 0 and remove any positive cooldown ice overrides.{rst}" >&2
+} # ]]]
+# FUNCTION: .zinit-cooldown-hold-message [[[
+# Format a resource/runtime hold for the eventual update callers. $1 is update
+# or self-update, $2 is the plugin ID (empty for self-update), then the selector
+# reply. Return plain text in REPLY; print it with `print -r`, not as formatting
+# code. Unknown reasons return 1 so the caller can handle age/other outcomes.
+# Keep this separate from policy: a hold with no ETA never invents a wait time.
+.zinit-cooldown-hold-message() {
+    builtin emulate -LR zsh
+    setopt extendedglob typesetsilent noshortloops
+    local action=$1 target=$2 label bypass detail subject amount maximum
+    local -a decision=( "${@:3}" )
+    REPLY=
+    [[ $decision[1] = (deferred|ready) && -z $decision[5] ]] || return 1
+    case $action in
+        self-update) label=zinit; bypass='zinit self-update -C' ;;
+        update)
+            [[ -n $target && $target != -* ]] || return 1
+            label=${(q)target}
+            bypass="zinit update -C ${(q)target}"
+            ;;
+        *) return 1 ;;
+    esac
+    case $decision[4] in
+        limit)
+            subject=$decision[7] amount=$decision[8] maximum=$decision[9]
+            [[ $subject = (|[0-9a-f](#c40)|[0-9a-f](#c64)) &&
+                $amount = [0-9]## && ${#amount} -le 12 &&
+                $maximum = [0-9]## && ${#maximum} -le 12 ]] || return 1
+            subject=${subject:-unknown}
+            case $decision[6] in
+                parents) detail="commit $subject has $amount parents (limit $maximum)" ;;
+                record-bytes) detail="commit $subject has a $amount-byte record (limit $maximum bytes)" ;;
+                history-bytes) detail="history scan reached at least $amount bytes (limit $maximum bytes)" ;;
+                installed-bytes) detail="installed history scan reached at least $amount bytes (limit $maximum bytes)" ;;
+                shallow-bytes) detail="shallow history metadata reached at least $amount bytes (limit $maximum bytes)" ;;
+                # The installed scan is bounded, so these are not all proven new.
+                introduced-commits) detail="ancestry check for commit $subject reached at least $amount commits (limit $maximum)" ;;
+                tip-ancestry) detail="ancestry of commit $subject cannot be proved within the $maximum-commit scan limit" ;;
+                installed-ancestry) detail="installed ancestry at $subject cannot be proved within the $maximum-commit scan limit" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        runtime-version) detail='cooldown requires Zsh 5.4.1 or newer' ;;
+        runtime-modules) detail='required Zsh cooldown modules are unavailable' ;;
+        runtime-pty) detail='a cooldown PTY worker could not start' ;;
+        output-limit) detail='observation diagnostics exceed the 65536-byte limit' ;;
+        result-limit) detail='the observation result exceeds the 1048576-byte limit' ;;
+        result-count-limit) detail='the observation result exceeds the 20010-value limit' ;;
+        *) return 1 ;;
+    esac
+    if [[ $decision[1] = ready ]]; then
+        REPLY="$label: newer commits held: $detail."
+    else
+        REPLY="$label: update held: $detail."
+    fi
+    REPLY+=" No eligibility date. Intentional bypass: $bypass"
+} # ]]]
 # FUNCTION: .zinit-cooldown-worker [[[
 # Internal zpty guardian. Keep the group leader alive until its owner deletes
 # the PTY, including after the callback exits. HUP then kills remaining group
@@ -1994,7 +2070,7 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
             local -a reply=()
             integer callback_rc=0 result_bytes=64
             "$@" </dev/null || callback_rc=$?
-            (( ${#reply} <= 20010 )) || return 65
+            (( ${#reply} <= 20010 )) || return 66
             for item in "${reply[@]}"; do
                 [[ $item != *$'\0'* ]] || return 1
                 # Include separators and reserve space for the frame before
@@ -2015,6 +2091,8 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
     result=$?
     if (( result == 65 )); then
         builtin print -r -- result-limit
+    elif (( result == 66 )); then
+        builtin print -r -- result-count-limit
     elif (( result )); then
         builtin print -r -- failed
     else
@@ -2051,7 +2129,7 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
         if zselect -a ready -r $fd -t $(( budget * 100 )); then
             zpty -r "$worker" message || message=failed
             message=${message%$'\n'} message=${message%$'\r'}
-            [[ $message = (complete|failed|result-limit) ]] || message=failed
+            [[ $message = (complete|failed|result-limit|result-count-limit) ]] || message=failed
         else
             message=timeout
         fi
@@ -2092,8 +2170,16 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
     (( budget <= 120 )) || return 1
     shift
     # Older zpty versions can signal unrelated PTYs when deleting a worker.
-    is-at-least 5.4.1 || return 1
-    zmodload zsh/zpty && zmodload zsh/system && zmodload zsh/zselect && zmodload zsh/stat || return 1
+    if ! is-at-least 5.4.1; then
+        reply=( deferred '' '' runtime-version '' )
+        .zinit-cooldown-runtime-warning runtime-version
+        return 1
+    fi
+    if ! { zmodload zsh/zpty && zmodload zsh/system && zmodload zsh/zselect && zmodload zsh/stat; } 2>/dev/null; then
+        reply=( deferred '' '' runtime-modules '' )
+        .zinit-cooldown-runtime-warning runtime-modules
+        return 1
+    fi
     scratch=$(command mktemp -d "${TMPDIR:-/tmp}/zinit-cooldown-run.XXXXXXXX") || return 1
     worker=${scratch:t}
     {
@@ -2102,6 +2188,7 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
             # zpty joins its arguments as shell code: quote each argument, including
             # empty strings and paths. Only the fixed guardian name is executable.
             # Inherited tracing would also be printed on the control PTY.
+            reply=( deferred '' '' runtime-pty '' )
             unsetopt xtrace
             zpty -b "$worker" .zinit-cooldown-guard "${(q)scratch}" "$budget" "${(@q)@}" 2>/dev/null || return 1
             created=1 fd=$REPLY
@@ -2114,6 +2201,7 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
             [[ $message = $'ready\r\n' || $message = $'ready\n' ]] || return 1
             (( ! cancelled )) || return 130
             zpty -w "$worker" start || return 1
+            reply=( deferred '' '' runtime '' )
             if ! zselect -a ready -r $fd -t $(( budget * 100 )) 2>/dev/null; then
                 reply=( deferred '' '' timeout '' )
                 return 124
@@ -2131,8 +2219,8 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
                 return 1
             fi
             REPLY=$(<"$scratch/log")
-            if [[ $message = result-limit ]]; then
-                reply=( deferred '' '' result-limit '' )
+            if [[ $message = (result-limit|result-count-limit) ]]; then
+                reply=( deferred '' '' "$message" '' )
                 return 1
             fi
             [[ $message = complete && -f $scratch/result && ! -L $scratch/result ]] || return 1
@@ -2167,6 +2255,7 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
         REPLY=
         return 130
     fi
+    [[ $reply[4] != runtime-pty ]] || .zinit-cooldown-runtime-warning runtime-pty
     return $rc
 } # ]]]
 # FUNCTION: .zinit-cooldown-now [[[
@@ -2451,7 +2540,7 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
     local shallow_snapshot
     local -a rows fields stack limit_detail
     local -A ages installed commits dates parents first_parent boundaries visiting ready_at unknown contains_head limited_by
-    integer duration rc installed_limit=0 installed_shallow=0 walked=0
+    integer duration rc parent_count installed_limit=0 installed_shallow=0 walked=0
     reply=( error '' '' '' '' )
     (( $# >= 6 && $# <= 20006 && ($# - 6) % 2 == 0 )) || return 1
     [[ $head = ([0-9a-f](#c40)|[0-9a-f](#c64)) &&
@@ -2572,6 +2661,17 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
         rows=( "${(@f)history}" )
         for line in "${rows[@]}"; do
             [[ -z $line ]] && continue
+            # The complete output is already byte-bounded. Native word count
+            # scans without a field array or costly per-character substitution.
+            # Count before the record cap to report unusually wide commits;
+            # timestamp and commit ID are the first two space-separated fields.
+            parent_count=$(( ${(Ws: :)#line} - 2 ))
+            if (( parent_count > 256 )); then
+                oid=${${line#* }%% *}
+                [[ $oid = ([0-9a-f](#c40)|[0-9a-f](#c64)) ]] || oid=
+                reply=( deferred '' '' limit '' parents "$oid" "$parent_count" 256 )
+                return 0
+            fi
             if (( ${#line} > 32768 )); then
                 oid=${${line#* }%% *}
                 [[ $oid = ([0-9a-f](#c40)|[0-9a-f](#c64)) ]] || oid=
@@ -2579,10 +2679,6 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
                 return 0
             fi
             fields=( "${(@s: :)line}" )
-            if (( ${#fields} > 258 )); then
-                reply=( deferred '' '' limit '' parents "$fields[2]" "$(( ${#fields} - 2 ))" 256 )
-                return 0
-            fi
             timestamp=$fields[1] oid=$fields[2]
             [[ $timestamp = (|-)[0-9]## && ${#timestamp} -le 12 &&
                 $oid = ([0-9a-f](#c40)|[0-9a-f](#c64)) && ${#oid} = ${#head} && ! -v commits[$oid] ]] || return 1
