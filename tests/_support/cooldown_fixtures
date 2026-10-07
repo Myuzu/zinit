@@ -41,6 +41,39 @@ cooldown_release() {
     cooldown_assert_no_refs
 }
 
+# Graph policy tests use real objects and successful local observation records.
+# Network/ref revalidation belongs to the fetching caller, not this decision.
+cooldown_graph_fixture() {
+    cooldown_fixture || return 1
+    ZINIT[HOME_DIR]=$COOLDOWN_FIXTURE_DIR/state-home
+    typeset -g COOLDOWN_GRAPH_NOW=1800000000 COOLDOWN_GRAPH_HEAD=$COOLDOWN_BASE COOLDOWN_GRAPH_TIP
+    typeset -ga COOLDOWN_GRAPH_SNAPSHOT=()
+    .zinit-cooldown-now() { REPLY=$COOLDOWN_GRAPH_NOW; }
+}
+
+cooldown_graph_observe() {
+    local token published selected=${1:-refs/heads/main}
+    local -a reply commits
+    local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=''
+    .zinit-cooldown-observation begin "$COOLDOWN_LOCAL" "$COOLDOWN_REMOTE" "$selected" || return 1
+    token=$reply[1]
+    command git -C "$COOLDOWN_LOCAL" fetch --quiet --no-tags --recurse-submodules=no origin "$selected" || return 1
+    published=$(command git -C "$COOLDOWN_LOCAL" rev-parse FETCH_HEAD) || return 1
+    COOLDOWN_GRAPH_TIP=$(command git -C "$COOLDOWN_LOCAL" rev-parse 'FETCH_HEAD^{commit}') || return 1
+    commits=( "${(@f)$(command git -C "$COOLDOWN_LOCAL" rev-list "$COOLDOWN_GRAPH_HEAD..$COOLDOWN_GRAPH_TIP")}" )
+    commits=( "${(@)commits:#}" )
+    .zinit-cooldown-observation publish "$COOLDOWN_LOCAL" "$COOLDOWN_REMOTE" "$selected" \
+        "$token" "$published" "${commits[@]}" || return 1
+    COOLDOWN_GRAPH_SNAPSHOT=( "${reply[@]}" )
+}
+
+cooldown_graph_select() {
+    typeset -g COOLDOWN_GRAPH_RC=0
+    .zinit-select-observed-target "$COOLDOWN_LOCAL" "$COOLDOWN_GRAPH_HEAD" "$COOLDOWN_GRAPH_TIP" \
+        "${1:-branch}" "${2:-10}" "$COOLDOWN_GRAPH_SNAPSHOT[2]" \
+        "${(@)COOLDOWN_GRAPH_SNAPSHOT[5,-1]}" || COOLDOWN_GRAPH_RC=$?
+}
+
 # Storage tests use an internal clock helper, never a user-facing override.
 cooldown_observation_fixture() {
     typeset -g COOLDOWN_STORE_DIR COOLDOWN_STORE_SCOPE COOLDOWN_STORE_SOURCE

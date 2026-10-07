@@ -573,6 +573,492 @@
     assert "${result//$'\n'/,}" same_as '10,10,0'
 }
 
+@test 'observed Git updates cannot bypass the wait by backdating every commit' {
+    local REPLY
+    local -a reply
+    cooldown_graph_fixture
+    cooldown_commit forged-parent 1600000000 1600000000
+    cooldown_commit forged-child 1600000001 1600000001
+    cooldown_graph_observe
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as age
+    assert $reply[5] same_as 1800864000
+    COOLDOWN_GRAPH_NOW=1800863999
+    cooldown_graph_select pin
+    assert $reply[1] same_as deferred
+    COOLDOWN_GRAPH_NOW=1800864000
+    cooldown_graph_select pin
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as "$COOLDOWN_GRAPH_TIP"
+    assert "$(git -C "$COOLDOWN_LOCAL" rev-parse HEAD)" same_as "$COOLDOWN_BASE"
+    cooldown_assert_no_refs
+}
+
+@test 'observed Git updates check young parents even when their children are backdated' {
+    local REPLY prefix parent
+    local -a reply
+    cooldown_graph_fixture
+    cooldown_commit old-prefix 1700000001
+    prefix=$REPLY
+    cooldown_commit future-parent 1900000000
+    parent=$REPLY
+    cooldown_commit backdated-child 1600000000
+    cooldown_graph_observe
+    COOLDOWN_GRAPH_NOW=1800864000
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as "$prefix"
+    assert $reply[4] same_as age
+    assert $reply[5] same_as 1900864000
+    cooldown_graph_select pin
+    assert $reply[1] same_as deferred
+    assert $reply[5] same_as 1900864000
+}
+
+@test 'observed Git merge updates include the committer age of side branch ancestry' {
+    local REPLY prefix
+    local -a reply
+    cooldown_graph_fixture
+    cooldown_commit old-prefix 1700000001
+    prefix=$REPLY
+    git -C "$COOLDOWN_REMOTE" checkout --quiet -b side "$COOLDOWN_BASE"
+    print side > "$COOLDOWN_REMOTE/side"
+    git -C "$COOLDOWN_REMOTE" add side
+    GIT_AUTHOR_DATE='@1600000000 +0000' GIT_COMMITTER_DATE='@1900000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" -c commit.gpgsign=false commit --quiet -m young-side
+    git -C "$COOLDOWN_REMOTE" checkout --quiet main
+    GIT_AUTHOR_DATE='@1600000000 +0000' GIT_COMMITTER_DATE='@1600000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" -c commit.gpgsign=false merge --quiet --no-ff -m backdated-merge side
+    cooldown_graph_observe
+    COOLDOWN_GRAPH_NOW=1800864000
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as "$prefix"
+    assert $reply[5] same_as 1900864000
+    cooldown_graph_select pin
+    assert $reply[1] same_as deferred
+}
+
+@test 'observed Git branch growth preserves the older eligible prefix' {
+    local REPLY prefix
+    local -a reply
+    cooldown_graph_fixture
+    cooldown_commit prefix 1700000001
+    prefix=$REPLY
+    cooldown_graph_observe
+    COOLDOWN_GRAPH_NOW=1800864000
+    cooldown_commit newly-published 1600000000
+    cooldown_graph_observe
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as "$prefix"
+    assert $reply[4] same_as age
+    assert $reply[5] same_as 1801728000
+    cooldown_graph_select pin
+    assert $reply[1] same_as deferred
+}
+
+@test 'observed Git updates hold missing records and observable clock rollback without an ETA' {
+    local REPLY ancestor
+    local -a reply saved
+    local -A ages
+    cooldown_graph_fixture
+    cooldown_commit ancestor 1700000001
+    ancestor=$REPLY
+    cooldown_commit tip 1700000002
+    cooldown_graph_observe
+    saved=( "${COOLDOWN_GRAPH_SNAPSHOT[@]}" )
+    ages=( "${(@)saved[5,-1]}" )
+    unset "ages[$ancestor]"
+    COOLDOWN_GRAPH_SNAPSHOT=( "${(@)saved[1,4]}" "${(@kv)ages}" )
+    COOLDOWN_GRAPH_NOW=1800864000
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as observations
+    assert "$reply[5]" is_empty
+    COOLDOWN_GRAPH_SNAPSHOT=( "${saved[@]}" )
+    COOLDOWN_GRAPH_NOW=1799999999
+    cooldown_graph_select
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as clock
+    assert "$reply[5]" is_empty
+}
+
+@test 'observed Git updates reject changed HEAD and keep installed pins as no-ops' {
+    local REPLY
+    local -a reply
+    cooldown_graph_fixture
+    cooldown_commit update 1700000001
+    cooldown_graph_observe
+    COOLDOWN_GRAPH_NOW=1800864000
+    git -C "$COOLDOWN_LOCAL" update-ref refs/heads/main "$COOLDOWN_GRAPH_TIP"
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as changed
+    COOLDOWN_GRAPH_HEAD=$COOLDOWN_GRAPH_TIP
+    COOLDOWN_GRAPH_SNAPSHOT=( '' '' '' '' )
+    cooldown_graph_select pin
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as current
+    assert $reply[2] same_as "$COOLDOWN_GRAPH_TIP"
+}
+
+@test 'promisor configurations hold before any command can lazily fetch objects' {
+    local key trace
+    local -a reply
+    cooldown_graph_fixture
+    cooldown_commit update 1700000001
+    cooldown_graph_observe
+    COOLDOWN_GRAPH_NOW=1800864000
+    cooldown_graph_select
+    assert $reply[1] same_as ready
+    local -x GIT_TRACE=$COOLDOWN_FIXTURE_DIR/git-trace
+    for key in remote.origin.promisor remote.cache.promisor remote.cache.partialCloneFilter extensions.partialClone; do
+        git -C "$COOLDOWN_LOCAL" config "$key" true
+        # Git can retain an earlier true even when a later setting is false.
+        if [[ $key = *.promisor ]]; then
+            git -C "$COOLDOWN_LOCAL" config --add "$key" false
+        fi
+        : > "$GIT_TRACE"
+        cooldown_graph_select
+        assert $COOLDOWN_GRAPH_RC equals 0
+        assert $reply[1] same_as deferred
+        assert $reply[4] same_as partial
+        assert "$reply[5]" is_empty
+        trace=$(<"$GIT_TRACE")
+        assert "$trace" does_not_contain rev-parse
+        assert "$trace" does_not_contain rev-list
+        assert "$trace" does_not_contain fetch
+        git -C "$COOLDOWN_LOCAL" config --unset-all "$key"
+    done
+    git -C "$COOLDOWN_LOCAL" config remote.origin.promisor true
+    : > "$COOLDOWN_FIXTURE_DIR/empty-config"
+    local -x GIT_CONFIG=$COOLDOWN_FIXTURE_DIR/empty-config
+    : > "$GIT_TRACE"
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as partial
+    assert "$GIT_CONFIG" same_as "$COOLDOWN_FIXTURE_DIR/empty-config"
+    trace=$(<"$GIT_TRACE")
+    assert "$trace" does_not_contain rev-parse
+    assert "$trace" does_not_contain rev-list
+    assert "$trace" does_not_contain fetch
+    unset GIT_CONFIG
+    git -C "$COOLDOWN_LOCAL" config remote.origin.promisor false
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as ready
+}
+
+@test 'observed Git policy ignores replacements grafts and display configuration' {
+    local REPLY replacement original_ifs=$IFS
+    local -a reply
+    local -x GIT_GRAFT_FILE
+    cooldown_graph_fixture
+    cooldown_commit future-parent 1900000000
+    cooldown_commit old-child 1600000000
+    cooldown_graph_observe
+    COOLDOWN_GRAPH_NOW=1800864000
+    replacement=$(GIT_AUTHOR_DATE='@1600000000 +0000' GIT_COMMITTER_DATE='@1600000000 +0000' \
+        git -C "$COOLDOWN_LOCAL" -c commit.gpgsign=false commit-tree "$COOLDOWN_GRAPH_TIP^{tree}" -p "$COOLDOWN_BASE" -m substitute)
+    git -C "$COOLDOWN_LOCAL" replace "$COOLDOWN_GRAPH_TIP" "$replacement"
+    GIT_GRAFT_FILE=$COOLDOWN_FIXTURE_DIR/grafts
+    print -r -- "$COOLDOWN_GRAPH_TIP $COOLDOWN_BASE" > "$GIT_GRAFT_FILE"
+    git -C "$COOLDOWN_LOCAL" config advice.graftFileDeprecated false
+    git -C "$COOLDOWN_LOCAL" config log.showSignature true
+    git -C "$COOLDOWN_LOCAL" config log.showNotes true
+    IFS=:
+    cooldown_graph_select pin
+    IFS=$original_ifs
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as age
+    assert $reply[5] same_as 1900864000
+    assert "$GIT_GRAFT_FILE" same_as "$COOLDOWN_FIXTURE_DIR/grafts"
+    assert "$(git -C "$COOLDOWN_LOCAL" show -s --format=%ct "$COOLDOWN_GRAPH_TIP")" same_as 1600000000
+}
+
+@test 'alternate or transient shallow boundaries cannot hide a young merged ancestor' {
+    local tree parent side merge snapshot GIT_SHALLOW_FILE
+    local -a reply
+    cooldown_graph_fixture
+    tree=$(git -C "$COOLDOWN_REMOTE" rev-parse 'HEAD^{tree}')
+    parent=$(GIT_AUTHOR_DATE='@1900000000 +0000' GIT_COMMITTER_DATE='@1900000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" commit-tree "$tree" -p "$COOLDOWN_BASE" -m future-parent)
+    side=$(GIT_AUTHOR_DATE='@1600000000 +0000' GIT_COMMITTER_DATE='@1600000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" commit-tree "$tree" -p "$parent" -m backdated-child)
+    merge=$(GIT_AUTHOR_DATE='@1600000000 +0000' GIT_COMMITTER_DATE='@1600000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" commit-tree "$tree" -p "$COOLDOWN_BASE" -p "$side" -m backdated-merge)
+    git -C "$COOLDOWN_REMOTE" update-ref refs/heads/main "$merge"
+    git -C "$COOLDOWN_REMOTE" update-ref refs/heads/side "$side"
+    cooldown_graph_observe
+    COOLDOWN_GRAPH_NOW=1800864000
+    cooldown_graph_select pin
+    assert $reply[1] same_as deferred
+    assert $reply[5] same_as 1900864000
+    export GIT_SHALLOW_FILE=$COOLDOWN_FIXTURE_DIR/alternate-shallow
+    print -r -- "$side" > "$GIT_SHALLOW_FILE"
+    cooldown_graph_select pin
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as age
+    assert $reply[5] same_as 1900864000
+    assert "$GIT_SHALLOW_FILE" same_as "$COOLDOWN_FIXTURE_DIR/alternate-shallow"
+    unset GIT_SHALLOW_FILE
+
+    # These real fetches model another process changing then restoring shallow
+    # state during discovery. It cannot inherit the selector's private view.
+    mkdir "$COOLDOWN_FIXTURE_DIR/shim"
+    local -x COOLDOWN_GRAPH_REAL_GIT=${commands[git]} COOLDOWN_GRAPH_REPO=$COOLDOWN_LOCAL
+    local -x COOLDOWN_GRAPH_MARKER=$COOLDOWN_FIXTURE_DIR/snapshot-path
+    cat > "$COOLDOWN_FIXTURE_DIR/shim/git" <<'EOF'
+#!/bin/sh
+for argument do
+    if [ "$argument" = --timestamp ]; then
+        printf '%s\n' "$GIT_SHALLOW_FILE" > "$COOLDOWN_GRAPH_MARKER"
+        (unset GIT_SHALLOW_FILE; "$COOLDOWN_GRAPH_REAL_GIT" -C "$COOLDOWN_GRAPH_REPO" fetch --quiet --depth=1 origin side) || exit 72
+        "$COOLDOWN_GRAPH_REAL_GIT" "$@"
+        result=$?
+        (unset GIT_SHALLOW_FILE; "$COOLDOWN_GRAPH_REAL_GIT" -C "$COOLDOWN_GRAPH_REPO" fetch --quiet --unshallow origin main) || exit 73
+        exit "$result"
+    fi
+done
+exec "$COOLDOWN_GRAPH_REAL_GIT" "$@"
+EOF
+    chmod 700 "$COOLDOWN_FIXTURE_DIR/shim/git"
+    local -a path=( "$COOLDOWN_FIXTURE_DIR/shim" "${path[@]}" )
+    cooldown_graph_select pin
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as age
+    assert $reply[5] same_as 1900864000
+    assert "$(git -C "$COOLDOWN_LOCAL" rev-parse HEAD)" same_as "$COOLDOWN_GRAPH_HEAD"
+    run test ! -e "$COOLDOWN_LOCAL/.git/shallow"
+    assert $state equals 0
+    snapshot=$(<"$COOLDOWN_GRAPH_MARKER")
+    assert "$snapshot" is_not_empty
+    run test ! -e "$snapshot"
+    assert $state equals 0
+}
+
+@test 'deepened Git ancestry must earn its own first-seen age' {
+    local REPLY parent
+    local -a reply
+    local -A ages
+    cooldown_graph_fixture
+    cooldown_commit hidden-parent 1600000000
+    parent=$REPLY
+    cooldown_commit old-tip 1600000001
+    git -C "$COOLDOWN_LOCAL" fetch --quiet --depth=1 origin main
+    cooldown_graph_observe
+    COOLDOWN_GRAPH_NOW=1800864000
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as history
+    assert "$reply[5]" is_empty
+    git -C "$COOLDOWN_LOCAL" fetch --quiet --unshallow origin main
+    cooldown_graph_observe
+    ages=( "${(@)COOLDOWN_GRAPH_SNAPSHOT[5,-1]}" )
+    assert $ages[$COOLDOWN_GRAPH_TIP] same_as 1800000000
+    assert $ages[$parent] same_as 1800864000
+    cooldown_graph_select
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as age
+    assert $reply[5] same_as 1801728000
+    COOLDOWN_GRAPH_NOW=1801728000
+    cooldown_graph_select
+    assert $reply[1] same_as ready
+}
+
+@test 'unknown shallow side ancestry holds its merge but preserves a safe prefix' {
+    local REPLY prefix
+    local -a reply
+    cooldown_graph_fixture
+    cooldown_commit prefix 1700000001
+    prefix=$REPLY
+    git -C "$COOLDOWN_REMOTE" checkout --quiet -b side "$COOLDOWN_BASE"
+    print side > "$COOLDOWN_REMOTE/side"
+    git -C "$COOLDOWN_REMOTE" add side
+    GIT_AUTHOR_DATE='@1600000000 +0000' GIT_COMMITTER_DATE='@1600000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" -c commit.gpgsign=false commit --quiet -m side
+    git -C "$COOLDOWN_REMOTE" checkout --quiet main
+    GIT_AUTHOR_DATE='@1600000000 +0000' GIT_COMMITTER_DATE='@1600000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" -c commit.gpgsign=false merge --quiet --no-ff -m merge side
+    cooldown_graph_observe
+    COOLDOWN_GRAPH_NOW=1800864000
+    git -C "$COOLDOWN_LOCAL" fetch --quiet --depth=1 origin side
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as "$prefix"
+    assert $reply[4] same_as history
+    assert "$reply[5]" is_empty
+    cooldown_graph_select pin
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as history
+    git -C "$COOLDOWN_LOCAL" fetch --quiet --unshallow origin main
+    cooldown_graph_select pin
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as "$COOLDOWN_GRAPH_TIP"
+}
+
+@test 'observed Git divergence never produces an applicable candidate' {
+    local REPLY local_head
+    local -a reply
+    cooldown_graph_fixture
+    cooldown_commit remote-change 1600000000
+    local_head=$(git -C "$COOLDOWN_LOCAL" -c commit.gpgsign=false commit-tree 'HEAD^{tree}' -p HEAD -m local)
+    git -C "$COOLDOWN_LOCAL" update-ref refs/heads/main "$local_head"
+    COOLDOWN_GRAPH_HEAD=$local_head
+    cooldown_graph_observe
+    COOLDOWN_GRAPH_NOW=1800864000
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 1
+    assert $reply[1] same_as error
+    assert $reply[4] same_as divergence
+    assert "$reply[2]" is_empty
+    assert "$(git -C "$COOLDOWN_LOCAL" rev-parse HEAD)" same_as "$local_head"
+    git -C "$COOLDOWN_LOCAL" update-ref refs/heads/main "$COOLDOWN_BASE"
+    COOLDOWN_GRAPH_HEAD=$COOLDOWN_BASE
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as ready
+}
+
+@test 'first-parent fallback cannot leave an installed merge side' {
+    local REPLY installed
+    local -a reply
+    cooldown_graph_fixture
+    git -C "$COOLDOWN_REMOTE" checkout --quiet -b installed-side
+    print installed > "$COOLDOWN_REMOTE/installed"
+    git -C "$COOLDOWN_REMOTE" add installed
+    GIT_AUTHOR_DATE='@1600000000 +0000' GIT_COMMITTER_DATE='@1600000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" -c commit.gpgsign=false commit --quiet -m installed
+    installed=$(git -C "$COOLDOWN_REMOTE" rev-parse HEAD)
+    git -C "$COOLDOWN_LOCAL" fetch --quiet origin installed-side
+    git -C "$COOLDOWN_LOCAL" update-ref refs/heads/main "$installed"
+    COOLDOWN_GRAPH_HEAD=$installed
+    git -C "$COOLDOWN_REMOTE" checkout --quiet main
+    cooldown_commit old-other-side 1600000000
+    GIT_AUTHOR_DATE='@1900000000 +0000' GIT_COMMITTER_DATE='@1900000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" -c commit.gpgsign=false merge --quiet --no-ff -m young-merge installed-side
+    cooldown_graph_observe
+    COOLDOWN_GRAPH_NOW=1800864000
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as age
+    assert "$reply[2]" is_empty
+    COOLDOWN_GRAPH_NOW=1900864000
+    cooldown_graph_select
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as "$COOLDOWN_GRAPH_TIP"
+}
+
+@test 'observed Git policy bounds unusually wide parent lists without crashing' {
+    local count index tree tip
+    local -a reply
+    cooldown_graph_fixture
+    tree=$(git -C "$COOLDOWN_REMOTE" rev-parse 'HEAD^{tree}')
+    for count in 1 300 1000; do
+        # Git accepts these objects. Do not let a repeated parent pattern
+        # exhaust the shell's stack before the graph limits can hold it.
+        tip=$({
+            print -r -- "tree $tree"
+            for (( index=0; index<count; ++index )); do
+                print -r -- "parent $COOLDOWN_BASE"
+            done
+            print -r -- 'author zunit <zunit@localhost> 1600000000 +0000'
+            print -r -- 'committer zunit <zunit@localhost> 1600000000 +0000'
+            print
+            print -r -- wide-parents
+        } | git -C "$COOLDOWN_REMOTE" hash-object -t commit -w --stdin)
+        git -C "$COOLDOWN_REMOTE" update-ref refs/heads/main "$tip"
+        cooldown_graph_observe
+        (( COOLDOWN_GRAPH_NOW += 864000 ))
+        cooldown_graph_select
+        assert $COOLDOWN_GRAPH_RC equals 0
+        if (( count == 1 )); then
+            assert $reply[1] same_as ready
+            assert $reply[2] same_as "$tip"
+        else
+            assert $reply[1] same_as deferred
+            assert $reply[4] same_as limit
+            assert "$reply[5]" is_empty
+            assert $reply[7] same_as "$tip"
+            if (( count == 300 )); then
+                assert $reply[6] same_as parents
+                assert $reply[8] same_as 300
+                assert $reply[9] same_as 256
+            else
+                assert $reply[6] same_as record-bytes
+                assert $reply[9] same_as 32768
+            fi
+        fi
+    done
+}
+
+@test 'observed Git policy bounds discovery while allowing small updates to long histories' {
+    local count omitted object
+    local -a reply
+    cooldown_graph_fixture
+    {
+        print -r -- 'reset refs/heads/main'
+        print -r -- "from $COOLDOWN_BASE"
+        print
+        for count in {1..15050}; do
+            print -r -- 'commit refs/heads/main'
+            print -r -- "committer zunit <zunit@localhost> $((1600000000 + count)) +0000"
+            print -r -- 'data 6'
+            print -r -- 'hidden'
+            print
+        done
+    } | git -C "$COOLDOWN_REMOTE" fast-import --quiet
+    git -C "$COOLDOWN_LOCAL" -c fetch.unpackLimit=20000 -c gc.auto=0 fetch --quiet origin main
+    COOLDOWN_GRAPH_TIP=$(git -C "$COOLDOWN_LOCAL" rev-parse FETCH_HEAD)
+    COOLDOWN_GRAPH_SNAPSHOT=( '' "$COOLDOWN_GRAPH_NOW" '' '' )
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as limit
+    assert "$reply[5]" is_empty
+    assert $reply[6] same_as introduced-commits
+    assert $reply[7] same_as "$COOLDOWN_GRAPH_TIP"
+    assert $reply[8] same_as 10001
+    assert $reply[9] same_as 10000
+    # A missing object beyond the scan bound must not be read during Git's
+    # setup, as happens with --topo-order or an exclusion range (^HEAD).
+    omitted=$(git -C "$COOLDOWN_LOCAL" rev-parse "$COOLDOWN_GRAPH_TIP~14000")
+    object="$COOLDOWN_LOCAL/.git/objects/${omitted[1,2]}/${omitted[3,-1]}"
+    mv "$object" "$COOLDOWN_FIXTURE_DIR/omitted-object"
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as limit
+    assert "$reply[5]" is_empty
+    mv "$COOLDOWN_FIXTURE_DIR/omitted-object" "$object"
+    # The discovery limit must not require aging already installed history.
+    COOLDOWN_GRAPH_HEAD=$(git -C "$COOLDOWN_LOCAL" rev-parse "$COOLDOWN_GRAPH_TIP^")
+    git -C "$COOLDOWN_LOCAL" update-ref refs/heads/main "$COOLDOWN_GRAPH_HEAD"
+    cooldown_graph_observe
+    (( COOLDOWN_GRAPH_NOW += 864000 ))
+    cooldown_graph_select
+    assert $COOLDOWN_GRAPH_RC equals 0
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as "$COOLDOWN_GRAPH_TIP"
+}
+
 @test 'Git cooldown includes the boundary using committer date and keeps HEAD unchanged' {
     local REPLY expected
     local -a reply

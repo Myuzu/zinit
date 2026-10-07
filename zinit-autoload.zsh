@@ -2222,6 +2222,293 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
     done
     return 1
 } # ]]]
+# FUNCTION: .zinit-select-observed-target [[[
+# Evaluate an already fetched update without changing refs or the checkout.
+# $1: repository; $2: installed commit; $3: requested tip commit; $4: branch|pin;
+# $5: positive cooldown days; $6: successful publication's clock high-water;
+# remaining arguments: commit/first-seen pairs from that SAME publication.
+# Only pass admission data from a successful .zinit-cooldown-observation publish.
+# The caller must verify source/ref reachability and tag movement, own the fetch
+# refs, and revalidate before applying. This helper does no network I/O.
+# Pins and tags must be reachable from the source's current advertised branches;
+# fetching a SHA or tag alone does not establish that publication proof.
+# reply = (ready|current|deferred commit '' reason eligible-at).
+# reason and eligible-at describe the requested tip, even for a ready prefix;
+# unknown proof has no ETA. Errors return 1, normal deferrals/current return 0.
+# For reason=limit, append (cap subject-commit observed maximum). Byte counts
+# are lower bounds when output was truncated. An ancestry cap means the scan
+# cannot prove a parent, not that every scanned commit would be newly installed.
+# These caps bound our input/processing, not Git's internal CPU/memory or fetch.
+# All introduced ancestors count, including merged side branches. First-parent
+# order only chooses a branch prefix; pins never substitute an older revision.
+.zinit-select-observed-target() {
+    builtin emulate -LR zsh ${=${options[xtrace]:#off}:+-o xtrace}
+    setopt extendedglob typesetsilent warncreateglobal noshortloops pipefail
+    local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE='' GIT_NO_LAZY_FETCH=1
+    local -x LC_ALL=C
+    # GIT_CONFIG redirects only `git config', unlike object-reading commands.
+    # Both preflight and traversal must use the repository's effective config.
+    local +x GIT_CONFIG GIT_SHALLOW_FILE
+    local repo=$1 head=$2 tip=$3 kind=$4 days=$5 observed_at=$6
+    local REPLY actual shallow_path shallow_before shallow_after history line oid seen timestamp parent candidate reason eta now
+    local shallow_snapshot
+    local -a rows fields stack limit_detail
+    local -A ages installed commits dates parents first_parent boundaries visiting ready_at unknown contains_head limited_by
+    integer duration rc installed_limit=0 installed_shallow=0 walked=0
+    reply=( error '' '' '' '' )
+    (( $# >= 6 && $# <= 20006 && ($# - 6) % 2 == 0 )) || return 1
+    [[ $head = ([0-9a-f](#c40)|[0-9a-f](#c64)) &&
+        $tip = ([0-9a-f](#c40)|[0-9a-f](#c64)) && ${#tip} = ${#head} &&
+        $kind = (branch|pin) ]] || return 1
+    .zinit-normalize-cooldown "$days" || return 1
+    (( REPLY > 0 )) || return 1
+    duration=$(( REPLY * 86400 ))
+    # Older Git ignores GIT_NO_LAZY_FETCH. Refuse every supported promisor
+    # configuration before even resolving commit objects, without probing the
+    # network or relying on which objects happen to be present in this clone.
+    rc=0
+    command git -C "$repo" config --get-regexp \
+        '^(extensions\.partialclone|remote\..*\.partialclonefilter)$' >/dev/null || rc=$?
+    if (( rc == 0 )); then
+        reply=( deferred '' '' partial '' )
+        return 0
+    fi
+    (( rc == 1 )) || return 1
+    rc=0
+    history=$(command git -C "$repo" config --bool --get-regexp '^remote\..*\.promisor$') || rc=$?
+    (( rc <= 1 )) || return 1
+    for line in "${(@f)history}"; do
+        if [[ ${line##* } = true ]]; then
+            reply=( deferred '' '' partial '' )
+            return 0
+        fi
+    done
+    actual=$(command git -C "$repo" rev-parse --verify 'HEAD^{commit}') || return 1
+    if [[ $actual != "$head" ]]; then
+        reply=( deferred '' '' changed '' )
+        return 0
+    fi
+    # Installed pins are no-ops, even when their age records are unavailable.
+    if [[ $tip = "$head" ]]; then
+        reply=( current "$head" '' '' '' )
+        return 0
+    fi
+    [[ $observed_at = (0|[1-9][0-9]#) && ${#observed_at} -le 12 ]] || return 1
+    shift 6
+    for oid seen in "$@"; do
+        [[ $oid = ([0-9a-f](#c40)|[0-9a-f](#c64)) && ${#oid} = ${#head} &&
+            ! -v ages[$oid] && $seen = (0|[1-9][0-9]#) && ${#seen} -le 12 ]] || return 1
+        (( seen <= observed_at )) || return 1
+        ages[$oid]=$seen
+    done
+    .zinit-cooldown-now || return 1
+    now=$REPLY
+    [[ $now = (0|[1-9][0-9]#) && ${#now} -le 12 ]] || return 1
+    if (( now < observed_at )); then
+        reply=( deferred '' '' clock '' )
+        return 0
+    fi
+    actual=$(command git -C "$repo" rev-parse --verify "$tip^{commit}") || return 1
+    [[ $actual = "$tip" ]] || return 1
+    shallow_path=$(command git -C "$repo" rev-parse --git-path shallow) || return 1
+    [[ $shallow_path = /* ]] || shallow_path="$repo/$shallow_path"
+    if [[ -e $shallow_path ]]; then
+        shallow_before=$(command head -c 1048577 -- "$shallow_path" && builtin print -rn -- .) || return 1
+        shallow_before=${shallow_before%.}
+        if (( ${#shallow_before} > 1048576 )); then
+            reply=( deferred '' '' limit '' shallow-bytes '' "${#shallow_before}" 1048576 )
+            return 0
+        fi
+        for oid in "${(@f)shallow_before}"; do
+            [[ -z $oid ]] && continue
+            [[ $oid = ([0-9a-f](#c40)|[0-9a-f](#c64)) && ${#oid} = ${#head} ]] || return 1
+            boundaries[$oid]=1
+        done
+    fi
+    # Give every Git scan the same shallow view. Comparing the repository file
+    # before/after alone misses a concurrent fetch that changes and restores it.
+    shallow_snapshot=$(command mktemp "${TMPDIR:-/tmp}/zinit-cooldown-shallow.XXXXXXXX") || return 1
+    {
+        builtin print -rn -- "$shallow_before" >! "$shallow_snapshot" || return 1
+        local -x GIT_SHALLOW_FILE=$shallow_snapshot
+        # Neither topological sorting nor an exclusion range bounds Git's setup
+        # work with --max-count. Scan each ancestry independently, then stop the
+        # local traversal at proven installed ancestors. An incomplete scan grants
+        # no credit to an unknown parent, even when its object is cached locally.
+        rc=0
+        history=$(command git -C "$repo" rev-list --max-count=10001 "$head" -- | {
+            command head -c 1048577 && builtin print -rn -- .
+        }) || rc=$?
+        history=${history%.}
+        if (( ${#history} > 1048576 )); then
+            reply=( deferred '' '' limit '' installed-bytes "$head" "${#history}" 1048576 )
+            return 0
+        elif (( rc )); then
+            reply=( deferred '' '' history '' )
+            return 0
+        fi
+        history=${history%$'\n'}
+        rows=( "${(@f)history}" )
+        (( ${#rows} < 10001 )) || installed_limit=1
+        for oid in "${rows[@]}"; do
+            [[ $oid = ([0-9a-f](#c40)|[0-9a-f](#c64)) && ${#oid} = ${#head} ]] || return 1
+            installed[$oid]=1
+            [[ ! -v boundaries[$oid] ]] || installed_shallow=1
+        done
+        # Bound bytes too: one valid commit can contain many parent entries.
+        rc=0
+        # Keep the final newline when measuring the byte limit. Otherwise command
+        # substitution could hide truncation exactly at a record boundary.
+        history=$(command git -C "$repo" rev-list --timestamp --parents \
+            --max-count=10001 "$tip" -- | {
+            command head -c 2097153 && builtin print -rn -- .
+        }) || rc=$?
+        history=${history%.}
+        if (( ${#history} > 2097152 )); then
+            reply=( deferred '' '' limit '' history-bytes "$tip" "${#history}" 2097152 )
+            return 0
+        elif (( rc )); then
+            reply=( deferred '' '' history '' )
+            return 0
+        fi
+        history=${history%$'\n'}
+        rows=( "${(@f)history}" )
+        for line in "${rows[@]}"; do
+            [[ -z $line ]] && continue
+            if (( ${#line} > 32768 )); then
+                oid=${${line#* }%% *}
+                [[ $oid = ([0-9a-f](#c40)|[0-9a-f](#c64)) ]] || oid=
+                reply=( deferred '' '' limit '' record-bytes "$oid" "${#line}" 32768 )
+                return 0
+            fi
+            fields=( "${(@s: :)line}" )
+            if (( ${#fields} > 258 )); then
+                reply=( deferred '' '' limit '' parents "$fields[2]" "$(( ${#fields} - 2 ))" 256 )
+                return 0
+            fi
+            timestamp=$fields[1] oid=$fields[2]
+            [[ $timestamp = (|-)[0-9]## && ${#timestamp} -le 12 &&
+                $oid = ([0-9a-f](#c40)|[0-9a-f](#c64)) && ${#oid} = ${#head} && ! -v commits[$oid] ]] || return 1
+            [[ ! -v installed[$oid] ]] || continue
+            for parent in "${(@)fields[3,-1]}"; do
+                [[ $parent = ([0-9a-f](#c40)|[0-9a-f](#c64)) && ${#parent} = ${#head} ]] || return 1
+            done
+            commits[$oid]=1 dates[$oid]=$timestamp
+            parents[$oid]="${(j: :)fields[3,-1]}"
+            first_parent[$oid]=${fields[3]:-}
+        done
+        # Evaluate parents before children without trusting Git's date order. The
+        # explicit stack also avoids shell recursion for long, valid histories.
+        [[ ! -v commits[$tip] ]] || stack=( "$tip" )
+        while (( ${#stack} )); do
+            oid=$stack[-1]
+            if [[ -v ready_at[$oid] ]]; then
+                stack[-1]=()
+                continue
+            fi
+            if [[ ! -v visiting[$oid] ]]; then
+                (( ++walked <= 10000 )) || {
+                    reply=( deferred '' '' limit '' introduced-commits "$tip" "$walked" 10000 )
+                    return 0
+                }
+                visiting[$oid]=1
+                for parent in "${(@s: :)parents[$oid]}"; do
+                    [[ -n $parent && -v commits[$parent] && ! -v ready_at[$parent] ]] || continue
+                    [[ ! -v visiting[$parent] ]] || return 1
+                    stack+=( "$parent" )
+                done
+                continue
+            fi
+            ready_at[$oid]=0 contains_head[$oid]=0
+            if [[ -v boundaries[$oid] ]]; then
+                unknown[$oid]=history
+            elif [[ ! -v ages[$oid] ]]; then
+                unknown[$oid]=observations
+            fi
+            if [[ -v ages[$oid] ]]; then
+                ready_at[$oid]=$(( (ages[$oid] > dates[$oid] ? ages[$oid] : dates[$oid]) + duration ))
+            fi
+            for parent in "${(@s: :)parents[$oid]}"; do
+                [[ -n $parent ]] || continue
+                [[ ${#parent} = ${#head} ]] || return 1
+                if [[ $parent = "$head" ]]; then
+                    contains_head[$oid]=1
+                elif [[ -v commits[$parent] ]]; then
+                    [[ -v ready_at[$parent] ]] || return 1
+                    (( ! contains_head[$parent] )) || contains_head[$oid]=1
+                    if [[ ${unknown[$parent]} = history || -z ${unknown[$oid]} ||
+                        ( ${unknown[$parent]} = limit && ${unknown[$oid]} != history ) ]]; then
+                        unknown[$oid]=${unknown[$parent]}
+                        limited_by[$oid]=${limited_by[$parent]}
+                    fi
+                    (( ready_at[$parent] <= ready_at[$oid] )) || ready_at[$oid]=$ready_at[$parent]
+                elif [[ ! -v installed[$parent] && ${unknown[$oid]} != history ]]; then
+                    unknown[$oid]=limit
+                    limited_by[$oid]=$parent
+                fi
+            done
+            stack[-1]=()
+        done
+        # A concurrent fetch may deepen or replace shallow boundaries. Never apply
+        # a decision assembled from two different graph views.
+        if [[ -e $shallow_path ]]; then
+            shallow_after=$(command head -c 1048577 -- "$shallow_path" && builtin print -rn -- .) || return 1
+            shallow_after=${shallow_after%.}
+        fi
+        actual=$(command git -C "$repo" rev-parse --verify 'HEAD^{commit}') || return 1
+        if [[ $actual != "$head" || $shallow_after != "$shallow_before" ]]; then
+            reply=( deferred '' '' changed '' )
+            return 0
+        fi
+        .zinit-cooldown-now || return 1
+        [[ $REPLY = (0|[1-9][0-9]#) && ${#REPLY} -le 12 ]] || return 1
+        if (( REPLY < now )); then
+            reply=( deferred '' '' clock '' )
+            return 0
+        fi
+        now=$REPLY
+        if [[ ! -v commits[$tip] ]]; then
+            reply=( current "$head" '' '' '' )
+            return 0
+        fi
+        if (( ! contains_head[$tip] )); then
+            if [[ ${unknown[$tip]} = history ]] || (( installed_shallow )); then
+                reply=( deferred '' '' history '' )
+                return 0
+            fi
+            if [[ ${unknown[$tip]} = limit ]]; then
+                reply=( deferred '' '' limit '' tip-ancestry "$limited_by[$tip]" 10001 10001 )
+                return 0
+            elif (( installed_limit )); then
+                reply=( deferred '' '' limit '' installed-ancestry "$head" 10001 10001 )
+                return 0
+            fi
+            reply=( error '' '' divergence '' )
+            return 1
+        fi
+        reason=${unknown[$tip]}
+        if [[ -z $reason ]]; then
+            eta=$ready_at[$tip]
+            (( eta <= now )) || reason=age
+        elif [[ $reason = limit ]]; then
+            limit_detail=( tip-ancestry "$limited_by[$tip]" 10001 10001 )
+        fi
+        candidate=$tip
+        while [[ -v commits[$candidate] ]]; do
+            if (( contains_head[$candidate] )) && [[ -z ${unknown[$candidate]} ]] && (( ready_at[$candidate] <= now )); then
+                reply=( ready "$candidate" '' "$reason" "$eta" "${limit_detail[@]}" )
+                return 0
+            fi
+            [[ $kind = branch ]] || break
+            candidate=$first_parent[$candidate]
+            [[ -n $candidate ]] || break
+        done
+        reply=( deferred '' '' "$reason" "$eta" "${limit_detail[@]}" )
+        return 0
+    } always {
+        command rm -f -- "$shallow_snapshot"
+    }
+} # ]]]
 # FUNCTION: .zinit-select-update-target [[[
 # Select a Git revision for a positive cooldown without changing the checkout.
 # $1 - repository, $2 - remote, $3 - branch/tag/full commit ID, $4 - cutoff epoch.
