@@ -41,6 +41,7 @@ if zmodload -F zsh/zutil +b:zstyle 2>/dev/null || (( ${+builtins[zstyle]} )); th
             compinit-opts   COMPINIT_OPTS    mute-warnings    MUTE_WARNINGS
             no-aliases      NO_ALIASES       packages-branch  PACKAGES_BRANCH
             packages-repo   PACKAGES_REPO
+            update-cooldown UPDATE_COOLDOWN
             optimize-out-disk-accesses OPTIMIZE_OUT_DISK_ACCESSES
         )
         for _attr _key in "${(kv)_map[@]}"; do
@@ -106,7 +107,7 @@ ZINIT[ice-list]="\
 \!bash|\!csh|\!ksh|\!sh|\
 aliases|as|atclone|atdelete|atinit|atload|atpull|autoload|\
 bash|binary|bindmap|blockf|bpick|build|\
-cloneonly|cloneopts|cmake|compile|completions|configure|countdown|cp|csh|\
+cloneonly|cloneopts|cmake|compile|completions|configure|cooldown|countdown|cp|csh|\
 debug|depth|\
 extract|\
 from|git|\
@@ -127,7 +128,7 @@ ZINIT[nval-ice-list]="\
 \!bash|\!csh|\!ksh|\!sh|\
 aliases|\
 bash|binary|blockf|\
-cloneonly|cloneopts|cmake|configure|countdown|csh|\
+cloneonly|cloneopts|cmake|configure|cooldown|countdown|csh|\
 debug|\
 git|\
 is-snippet|\
@@ -169,6 +170,7 @@ zstatus"
 : ${ZINIT[POLARIS_DIR]:=${ZINIT[HOME_DIR]}/polaris}
 : ${ZINIT[SERVICES_DIR]:=${ZINIT[HOME_DIR]}/services}
 : ${ZINIT[SNIPPETS_DIR]:=${ZINIT[HOME_DIR]}/snippets}
+: ${ZINIT[UPDATE_COOLDOWN]:=0}
 : ${ZINIT[ZPFX]:=${ZINIT[HOME_DIR]}/polaris}
 typeset -g ZPFX
 : ${ZPFX:=${ZINIT[ZPFX]}}
@@ -2282,16 +2284,24 @@ $match[7]}:-${ZINIT[__last-formatter-code]}}}:+}}}//←→}
         # Yes – a help message:
         +zi-log "{lhi}HELP FOR {apo}\`{cmd}$cmd{apo}\`{lhi} subcommand {mdsh}" \
                 "the available {b-lhi}options{ehi}:{rst}"
-        local opt
+        local opt txt
+        integer opt_width=14
+        for opt ( ${(s:|:)allowed} ) {
+            [[ $opt == --* ]] && continue
+            txt=${${___opt_map[$opt]%%:*}#opt_}
+            txt=$opt,${txt#*,}
+            (( ${#txt} > opt_width )) && opt_width=${#txt}
+        }
         for opt ( ${(kos:|:)allowed} ) {
             [[ $opt == --* ]] && continue
-            local msg=${___opt_map[$opt]#*:} txt=${___opt_map[(r)opt_$opt,--[^:]##]}
+            local msg=${___opt_map[$opt]#*:}
+            txt=${${___opt_map[$opt]%%:*}#opt_}
+            txt=$opt,${txt#*,}
             if [[ $msg == *":["* ]] {
                 msg=${${(MS)msg##$cmd:\[[^]]##}:-${(MS)msg##\*:\[[^]]##}}
                 msg=${msg#($cmd|\*):\[}
             }
-            local pre_msg=`+zi-log -n {opt}${(r:14:)${txt#opt_}}`
-            +zi-log ${(r:35:: :)pre_msg}{rst}{ehi}→{rst}"  $msg"
+            +zi-log "${ZINIT[col-opt]}${(r:opt_width:: :)txt}${ZINIT[col-rst]} {ehi}→{rst}  $msg"
         }
     } elif [[ -n $allowed ]] {
         shift 2
@@ -2351,11 +2361,25 @@ $match[7]}:-${ZINIT[__last-formatter-code]}}}:+}}}//←→}
     .zinit-validate-ice
     return retval
 } # ]]]
+# FUNCTION: .zinit-normalize-cooldown [[[
+# Validate before arithmetic expansion; REPLY is a decimal number of days.
+.zinit-normalize-cooldown() {
+    builtin emulate -L zsh -o extendedglob
+    [[ $1 = [0-9]## ]] || return 1
+    REPLY=${1##0#}
+    REPLY=${REPLY:-0}
+    (( ${#REPLY} <= 5 )) || return 1
+    (( REPLY <= 36500 ))
+} # ]]]
 # FUNCTION: .zinit-validate-ice [[[
 # Validates ice values at parse time.
 # Warns (not errors) about invalid values — behavior is unchanged.
 .zinit-validate-ice() {
     builtin setopt localoptions noksharrays extendedglob typesetsilent noshortloops
+    local REPLY
+    if [[ -n ${ZINIT_ICES[cooldown]} ]] && ! .zinit-normalize-cooldown "${ZINIT_ICES[cooldown]}"; then
+        +zi-log "{warn}Warning{b-warn}:{rst} {ice}cooldown{rst} expects an integer from 0 to 36500 days."
+    fi
     if (( $+ZINIT_ICES[as] )) && [[ -n ${ZINIT_ICES[as]} ]]; then
         case ${ZINIT_ICES[as]} in
             (command|program|null|completion) ;;
@@ -2700,6 +2724,8 @@ zinit() {
         --urge     opt_-u,--urge
         -n         opt_-n,--no-pager:"Disable the use of the pager."
         --no-pager opt_-n,--no-pager
+        -C         opt_-C,--no-cooldown:"Ignore the Git update cooldown for this invocation."
+        --no-cooldown opt_-C,--no-cooldown
         -m         opt_-m,--moments:"Show the {apo}*{b-lhi}moments{apo}*{rst} of object (i.e.: a plugin or snippet) loading time."
         --moments  opt_-m,--moments
         -b         opt_-b,--bindkeys:"Load in light mode, however do still track {cmd}bindkey{rst} calls (to allow remapping the keys bound)."
@@ -2713,9 +2739,9 @@ zinit() {
         light         "--help|-b|-h"
         snippet       "--command|--force|--help|-f|-h|-x"
         times         "--help|-h|-m|-s"
-        self-update   "--help|--no-pager|--quiet|-h|-n|-q"
+        self-update   "--help|--no-cooldown|--no-pager|--quiet|-C|-h|-n|-q"
         unload        "--help|--quiet|-h|-q"
-        update        "--all|--help|--no-pager|--parallel|--plugins|--quiet|--reset|--snippets|--urge|--verbose|-L|-a|-h|-n|-p|-q|-r|-s|-u|-v"
+        update        "--all|--help|--no-cooldown|--no-pager|--parallel|--plugins|--quiet|--reset|--snippets|--urge|--verbose|-C|-L|-a|-h|-n|-p|-q|-r|-s|-u|-v"
         version       ""
     )
 

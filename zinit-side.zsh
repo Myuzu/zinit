@@ -330,28 +330,33 @@
     svn
   )
 
-  command mkdir -p "$___pfx" && echo '*' > "$___pfx/.gitignore"
+  command mkdir -p "$___pfx" && builtin print -r -- '*' >! "$___pfx/.gitignore" || return 1
   local ___key ___var_name
   # No nval_ices here
   for ___key in ${ice_order[@]:#(${(~j:|:)nval_ices[@]})} ${(s: :)___add_ices[@]}; do
     ___var_name="${___ice_var}[$___key]"
-    (( ${(P)+___var_name} )) && builtin print -r -- "${(P)___var_name}" >! "$___pfx"/"$___key"
+    if (( ${(P)+___var_name} )); then
+      builtin print -r -- "${(P)___var_name}" >! "$___pfx"/"$___key" || return 1
+    fi
   done
 
   # Ices that even empty mean something
   for ___key in ${nval_ices[@]} ${(s: :)___add_ices2[@]}; do
     ___var_name="${___ice_var}[$___key]"
     if (( ${(P)+___var_name} )); then
-      builtin print -r -- "${(P)___var_name}" >! "$___pfx"/"$___key"
+      builtin print -r -- "${(P)___var_name}" >! "$___pfx"/"$___key" || return 1
     else
-      command rm -f "$___pfx"/"$___key"
+      command rm -f "$___pfx"/"$___key" || return 1
     fi
   done
 
   # url and mode are declared at the beginning of the body
   for ___key in url mode; do
-    [[ -n "${(P)___key}" ]] && builtin print -r -- "${(P)___key}" >! "$___pfx"/"$___key"
+    if [[ -n "${(P)___key}" ]]; then
+      builtin print -r -- "${(P)___key}" >! "$___pfx"/"$___key" || return 1
+    fi
   done
+  return 0
 } # ]]]
 # FUNCTION: .zinit-two-paths [[[
 # Obtains a snippet URL without specification if it is an SVN URL (points to

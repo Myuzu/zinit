@@ -1961,6 +1961,17 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
     done
 } # ]]]
 
+# FUNCTION: .zinit-update-cooldown [[[
+# Resolve only the supplied plugin override; self-update passes no override.
+.zinit-update-cooldown() {
+    if (( OPTS[opt_-C,--no-cooldown] )); then
+        REPLY=0
+        return 0
+    fi
+    .zinit-normalize-cooldown "${1:-${ZINIT[UPDATE_COOLDOWN]:-0}}" && return 0
+    +zi-log "{error}Invalid update cooldown: expected an integer from 0 to 36500 days.{rst}"
+    return 1
+} # ]]]
 # FUNCTION: .zi-check-for-git-changes [[[
 # Check for Git updates
 #

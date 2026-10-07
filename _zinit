@@ -275,6 +275,7 @@ _zinit_run(){
 # FUNCTION: _zinit_self_update [[[
 _zinit_self_update(){
   _arguments -A \
+    '(-C --no-cooldown)'{-C,--no-cooldown}'[Ignore the Git update cooldown for this invocation]' \
     '(-h --help)'{-h,--help}'[Show this help message]' \
     '(-n --no-pager)'{-n,--no-pager}'[Disable the use of the pager]' \
     '(-q --quiet)'{-q,--quiet}'[Turn off messages from the operation]' \
@@ -338,6 +339,7 @@ _zinit_unload(){
 # FUNCTION: _zinit_update [[[
 _zinit_update(){
   _arguments \
+    '(-C --no-cooldown)'{-C,--no-cooldown}'[Ignore the Git update cooldown for this invocation]' \
     '(-h --help)'{-h,--help}'[Show this help message]' \
     '(-n --no-pager)'{-n,--no-pager}'[Disable the use of the pager]' \
     '(-q --quiet)'{-q,--quiet}'[Turn off almost-all messages from the update operation FOR the objects which don'\''t have any new version available]' \

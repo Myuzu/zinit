@@ -1,0 +1,134 @@
+#!/usr/bin/env zunit
+# vim:ft=zsh:sw=4:sts=4:et:foldmarker={,}:foldmethod=marker
+
+@test 'cooldown validates decimal days before arithmetic' {
+    local REPLY value normalized rc
+    for value normalized in 0 0 000 0 08 8 00010 10 36500 36500; do
+        .zinit-normalize-cooldown "$value"
+        assert $? equals 0
+        assert $REPLY same_as $normalized
+    done
+    for value in '' -1 1.5 '1+2' 36501 999999999999999999999999999; do
+        rc=0
+        .zinit-normalize-cooldown "$value" || rc=$?
+        assert $rc equals 1
+    done
+}
+
+@test 'cooldown precedence and bypass do not mutate configuration' {
+    local -A OPTS ICE=( cooldown 9 )
+    local REPLY saved=${ZINIT[UPDATE_COOLDOWN]}
+    source "${ZINIT[BIN_DIR]}/zinit-autoload.zsh"
+    ZINIT[UPDATE_COOLDOWN]=10
+    .zinit-update-cooldown
+    assert $REPLY same_as 10
+    .zinit-update-cooldown 03
+    assert $REPLY same_as 3
+    .zinit-update-cooldown 0
+    assert $REPLY same_as 0
+    .zinit-update-cooldown ''
+    assert $REPLY same_as 10
+    run .zinit-update-cooldown invalid
+    assert $state equals 1
+    assert $output contains 'Invalid update cooldown'
+    OPTS[opt_-C,--no-cooldown]=1
+    .zinit-update-cooldown invalid
+    assert $? equals 0
+    assert $REPLY same_as 0
+    assert ${ZINIT[UPDATE_COOLDOWN]} same_as 10
+    assert ${ICE[cooldown]} same_as 9
+    ZINIT[UPDATE_COOLDOWN]=$saved
+}
+
+@test 'invalid cooldown remains a warning at parse time' {
+    run zinit ice cooldown'1+2'
+    assert $state equals 0
+    assert $output contains 'cooldown'
+    assert $output contains '36500'
+}
+
+@test 'cooldown bypass is parsed for both update commands' {
+    source "${ZINIT[BIN_DIR]}/zinit-autoload.zsh"
+    .zinit-self-update() { print -r -- "bypass=${OPTS[opt_-C,--no-cooldown]:-0}"; }
+    .zinit-update-or-status() { print -r -- "bypass=${OPTS[opt_-C,--no-cooldown]:-0}"; }
+    .zinit-update-or-status-all() { print -r -- "plugins=${OPTS[opt_-l,--plugins]:-0}"; }
+    local flag
+    for flag in -C --no-cooldown; do
+        run zinit self-update "$flag"
+        assert $state equals 0
+        assert $output contains 'bypass=1'
+        run zinit update "$flag" owner/plugin
+        assert $state equals 0
+        assert $output contains 'bypass=1'
+    done
+    run zinit self-update --help
+    assert $output contains '--no-cooldown'
+    run zinit update --help
+    assert $output contains '--no-cooldown'
+    assert $output contains '-L,--plugins'
+    assert $output does_not_contain '-l,--plugins'
+    run zinit update --all -L
+    assert $state equals 0
+    assert $output contains 'plugins=1'
+}
+
+@test 'empty cooldown survives recall and overrides stale saved days' {
+    source "${ZINIT[BIN_DIR]}/zinit-autoload.zsh"
+    local storage="${ZINIT[PLUGINS_DIR]}/cooldown---recall/._zinit" recalled
+    local -A ICE=() effective
+    local -a reply
+    local directory filename is_snippet REPLY
+    mkdir -p "$storage"
+    print ':' > "$storage/../recall.plugin.zsh"
+    print 'cooldown/recall' > "$storage/teleid"
+    print '' > "$storage/cooldown"
+    .zinit-recall cooldown/recall >/dev/null
+    read -rz recalled
+    assert "$recalled" contains cooldown
+    print 9 > "$storage/cooldown"
+    ZINIT_SICE=()
+    local rc=0
+    eval "$recalled light cooldown/recall" >/dev/null || rc=$?
+    assert $rc equals 0
+    .zinit-compute-ice cooldown/recall pack effective directory filename is_snippet
+    assert ${+effective[cooldown]} equals 1
+    assert "${effective[cooldown]}" is_empty
+}
+
+@test 'cooldown stores zero and empty inheritance with useful status' {
+    source "${ZINIT[BIN_DIR]}/zinit-side.zsh"
+    local -A test_ice=( cooldown 0 )
+    local storage="${ZINIT[HOME_DIR]}/cooldown-store"
+    .zinit-store-ices "$storage" test_ice '' '' '' ''
+    assert $? equals 0
+    assert "$(<$storage/cooldown)" same_as 0
+    test_ice[cooldown]=''
+    .zinit-store-ices "$storage" test_ice '' '' '' ''
+    assert $? equals 0
+    assert "$storage/cooldown" is_file
+    assert "$(<$storage/cooldown)" is_empty
+    print blocked > "$storage/blocker"
+    local rc=0
+    .zinit-store-ices "$storage/blocker/child" test_ice '' '' '' '' 2>/dev/null || rc=$?
+    assert $rc equals 1
+}
+
+@test 'cooldown zstyle is imported once and explicit zero wins' {
+    local result
+    result=$(zsh -fc '
+        typeset -gA ZINIT=( BIN_DIR "$1" HOME_DIR "$2" ZCOMPDUMP_PATH "$2/zcompdump" )
+        ZSH_CACHE_DIR="$2/cache"
+        mkdir -p "$ZSH_CACHE_DIR" || exit
+        zstyle ":zinit:config" update-cooldown 10
+        source "$1/zinit.zsh" >/dev/null || exit
+        print -r -- ${ZINIT[UPDATE_COOLDOWN]}
+        zstyle ":zinit:config" update-cooldown 20
+        source "$1/zinit.zsh" >/dev/null || exit
+        print -r -- ${ZINIT[UPDATE_COOLDOWN]}
+        ZINIT[UPDATE_COOLDOWN]=0
+        source "$1/zinit.zsh" >/dev/null || exit
+        print -r -- ${ZINIT[UPDATE_COOLDOWN]}
+    ' cooldown "${ZINIT[BIN_DIR]}" "${ZINIT[HOME_DIR]}/cooldown-config")
+    assert $? equals 0
+    assert "${result//$'\n'/,}" same_as '10,10,0'
+}

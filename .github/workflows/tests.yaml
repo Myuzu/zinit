@@ -36,6 +36,7 @@ jobs:
           - commands
           - compile
           - config-zstyle
+          - cooldown
           - gh-r
           - hook-handler
           - ice-validation
