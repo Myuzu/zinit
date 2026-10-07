@@ -1,6 +1,11 @@
 #!/usr/bin/env zunit
 # vim:ft=zsh:sw=4:sts=4:et:foldmarker={,}:foldmethod=marker
 
+@setup {
+    source "${ZINIT[BIN_DIR]}/zinit-autoload.zsh"
+    load "${PWD}/tests/_support/cooldown_fixtures"
+}
+
 @test 'cooldown validates decimal days before arithmetic' {
     local REPLY value normalized rc
     for value normalized in 0 0 000 0 08 8 00010 10 36500 36500; do
@@ -131,4 +136,398 @@
     ' cooldown "${ZINIT[BIN_DIR]}" "${ZINIT[HOME_DIR]}/cooldown-config")
     assert $? equals 0
     assert "${result//$'\n'/,}" same_as '10,10,0'
+}
+
+@test 'Git cooldown includes the boundary using committer date and keeps HEAD unchanged' {
+    local REPLY expected
+    local -a reply
+    cooldown_fixture
+    cooldown_commit boundary 1800000000 1900000000
+    expected=$REPLY
+    cooldown_commit recent 1800000001 1600000000
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as $expected
+    assert "$(git -C "$COOLDOWN_LOCAL" rev-parse HEAD)" same_as $COOLDOWN_BASE
+    assert "$(git -C "$COOLDOWN_LOCAL" rev-parse origin/main)" same_as $COOLDOWN_BASE
+    assert "$(git -C "$COOLDOWN_LOCAL" rev-parse "$reply[3]")" same_as $REPLY
+    cooldown_release
+}
+
+@test 'Git cooldown uses first parents despite an older merged side branch' {
+    local REPLY expected
+    local -a reply
+    cooldown_fixture
+    cooldown_commit eligible 1750000000
+    expected=$REPLY
+    git -C "$COOLDOWN_REMOTE" checkout --quiet -b side
+    print side > "$COOLDOWN_REMOTE/side"
+    git -C "$COOLDOWN_REMOTE" add side
+    GIT_AUTHOR_DATE='@1600000000 +0000' GIT_COMMITTER_DATE='@1600000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" -c commit.gpgsign=false commit --quiet -m side
+    git -C "$COOLDOWN_REMOTE" checkout --quiet main
+    cooldown_commit recent 1900000000
+    GIT_AUTHOR_DATE='@1900000001 +0000' GIT_COMMITTER_DATE='@1900000001 +0000' \
+        git -C "$COOLDOWN_REMOTE" -c commit.gpgsign=false merge --quiet --no-ff -m merge side
+    cooldown_select refs/heads/main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as $expected
+    cooldown_release
+}
+
+@test 'Git cooldown selects the nearest eligible first parent with nonmonotonic dates' {
+    local REPLY expected
+    local -a reply
+    cooldown_fixture
+    cooldown_commit newer-parent 1950000000
+    cooldown_commit eligible-child 1750000000
+    expected=$REPLY
+    cooldown_commit recent-tip 1900000000
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[2] same_as $expected
+    cooldown_release
+}
+
+@test 'Git cooldown never substitutes an ancestor for a recent tag or commit pin' {
+    local REPLY pin
+    local -a reply
+    cooldown_fixture
+    cooldown_commit recent 1900000000
+    pin=$REPLY
+    GIT_COMMITTER_DATE='@1600000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" -c tag.gpgsign=false tag -a -m release release
+    cooldown_select release
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as age
+    cooldown_assert_no_refs
+    cooldown_select "$pin"
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as deferred
+    cooldown_assert_no_refs
+    assert "$(git -C "$COOLDOWN_LOCAL" rev-parse HEAD)" same_as $COOLDOWN_BASE
+}
+
+@test 'Git cooldown accepts aged annotated tags and full commit pins' {
+    local REPLY pin
+    local -a reply
+    cooldown_fixture
+    cooldown_commit eligible 1750000000
+    pin=$REPLY
+    GIT_COMMITTER_DATE='@1900000000 +0000' \
+        git -C "$COOLDOWN_REMOTE" -c tag.gpgsign=false tag -a -m release release
+    cooldown_select refs/tags/release
+    assert $COOLDOWN_RC equals 0
+    assert $reply[2] same_as $pin
+    cooldown_release
+    cooldown_select "$pin"
+    assert $COOLDOWN_RC equals 0
+    assert $reply[2] same_as $pin
+    cooldown_release
+}
+
+@test 'Git cooldown rejects ambiguous names and accepts qualified refs' {
+    local REPLY pin
+    local -a reply
+    cooldown_fixture
+    git -C "$COOLDOWN_REMOTE" tag main
+    cooldown_commit eligible 1750000000
+    pin=$REPLY
+    cooldown_select main >/dev/null
+    assert $COOLDOWN_RC equals 1
+    cooldown_assert_no_refs
+    cooldown_select refs/heads/main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[2] same_as $pin
+    cooldown_release
+    cooldown_select refs/tags/main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as current
+    assert $reply[2] same_as $COOLDOWN_BASE
+    cooldown_assert_no_refs
+}
+
+@test 'Git cooldown keeps its source when another fetch overwrites FETCH_HEAD' {
+    local REPLY expected retained
+    local -a reply
+    cooldown_fixture
+    cooldown_commit expected 1750000000
+    expected=$REPLY
+    git -C "$COOLDOWN_REMOTE" checkout --quiet -b alternate "$COOLDOWN_BASE"
+    cooldown_commit wrong-branch 1750000001
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    retained=$reply[3]
+    git -C "$COOLDOWN_LOCAL" fetch --quiet origin alternate
+    assert "$(git -C "$COOLDOWN_LOCAL" rev-parse FETCH_HEAD)" same_as $REPLY
+    assert "$(git -C "$COOLDOWN_LOCAL" rev-parse "$retained")" same_as $expected
+    git -C "$COOLDOWN_LOCAL" merge --quiet --ff-only "$reply[2]"
+    assert "$(<$COOLDOWN_LOCAL/content)" same_as expected
+    cooldown_release
+}
+
+@test 'Git cooldown reports current without going backwards and rejects divergence' {
+    local REPLY
+    local -a reply
+    cooldown_fixture
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as current
+    cooldown_assert_no_refs
+    print local > "$COOLDOWN_LOCAL/local"
+    git -C "$COOLDOWN_LOCAL" add local
+    git -C "$COOLDOWN_LOCAL" -c commit.gpgsign=false commit --quiet -m local
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as current
+    cooldown_assert_no_refs
+    cooldown_commit divergent 1750000000
+    cooldown_select main >/dev/null
+    assert $COOLDOWN_RC equals 1
+    cooldown_assert_no_refs
+}
+
+@test 'Git cooldown deepens a shallow clone to establish ancestry' {
+    local REPLY expected
+    local -a reply
+    cooldown_fixture
+    cooldown_commit intermediate 1740000000
+    cooldown_commit eligible 1750000000
+    expected=$REPLY
+    cooldown_commit recent 1900000000
+    COOLDOWN_LOCAL=$COOLDOWN_FIXTURE_DIR/shallow
+    git clone --quiet --depth=1 "file://$COOLDOWN_REMOTE" "$COOLDOWN_LOCAL"
+    git -C "$COOLDOWN_LOCAL" fetch --quiet --depth=1 origin "$COOLDOWN_BASE"
+    git -C "$COOLDOWN_LOCAL" checkout --quiet --detach "$COOLDOWN_BASE"
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as $expected
+    cooldown_release
+}
+
+@test 'Git cooldown cleans private refs on fetch failure and age deferral' {
+    local REPLY
+    local -a reply
+    cooldown_fixture
+    cooldown_select refs/heads/missing 2>/dev/null
+    assert $COOLDOWN_RC equals 1
+    cooldown_assert_no_refs
+    cooldown_select main 1600000000
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as age
+    cooldown_assert_no_refs
+}
+
+@test 'Git cooldown bounds deepening and defers when eligibility is still unknown' {
+    local REPLY count
+    local -a reply
+    cooldown_fixture
+    # Keep the old base just outside the selector's bounded history window.
+    {
+        print -r -- 'reset refs/heads/main'
+        print -r -- "from $COOLDOWN_BASE"
+        print
+        for count in {1..3000}; do
+            print -r -- 'commit refs/heads/main'
+            print -r -- "committer zunit <zunit@localhost> $((1900000000 + count)) +0000"
+            print -r -- 'data 6'
+            print -r -- 'recent'
+            print
+        done
+    } | git -C "$COOLDOWN_REMOTE" fast-import --quiet
+    COOLDOWN_LOCAL=$COOLDOWN_FIXTURE_DIR/shallow
+    git clone --quiet --depth=1 "file://$COOLDOWN_REMOTE" "$COOLDOWN_LOCAL"
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as history
+    count=$(git -C "$COOLDOWN_LOCAL" rev-list --count HEAD)
+    assert $count is_greater_than 1
+    assert $count is_less_than 3000
+    cooldown_assert_no_refs
+}
+
+@test 'Git cooldown does not fetch unavailable dependencies of an ineligible tip' {
+    local REPLY child old_child missing_child eligible rc=0
+    local -a reply
+    cooldown_fixture
+    child=$COOLDOWN_FIXTURE_DIR/child
+    git -c init.defaultBranch=main init --quiet "$child"
+    git -C "$child" -c commit.gpgsign=false commit --quiet --allow-empty -m old-child
+    old_child=$(git -C "$child" rev-parse HEAD)
+    git clone --quiet --bare "$child" "$COOLDOWN_FIXTURE_DIR/child-published.git"
+    git -C "$COOLDOWN_REMOTE" -c protocol.file.allow=always submodule add --quiet \
+        "$COOLDOWN_FIXTURE_DIR/child-published.git" dependency
+    cooldown_commit eligible 1750000000
+    eligible=$REPLY
+    COOLDOWN_LOCAL=$COOLDOWN_FIXTURE_DIR/with-submodule
+    git -c protocol.file.allow=always clone --quiet --recurse-submodules "$COOLDOWN_REMOTE" "$COOLDOWN_LOCAL"
+    git -c protocol.file.allow=always clone --quiet --recurse-submodules "$COOLDOWN_REMOTE" "$COOLDOWN_FIXTURE_DIR/control"
+
+    # Publish only the parent referencing a child commit absent from its remote.
+    git -C "$child" -c commit.gpgsign=false commit --quiet --allow-empty -m missing-child
+    missing_child=$(git -C "$child" rev-parse HEAD)
+    git -C "$COOLDOWN_REMOTE" update-index --cacheinfo "160000,$missing_child,dependency"
+    cooldown_commit recent 1900000000
+    git -C "$COOLDOWN_FIXTURE_DIR/control" -c protocol.file.allow=always \
+        fetch --quiet --recurse-submodules=yes origin >/dev/null 2>&1 || rc=$?
+    assert $rc is_greater_than 0
+
+    git -C "$COOLDOWN_LOCAL" config fetch.recurseSubmodules true
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as current
+    assert $reply[2] same_as $eligible
+    assert "$(git -C "$COOLDOWN_LOCAL/dependency" rev-parse HEAD)" same_as $old_child
+    cooldown_assert_no_refs
+}
+
+@test 'Git cooldown retains independent private refs for overlapping selections' {
+    local REPLY first second
+    local -a reply
+    cooldown_fixture
+    cooldown_commit eligible 1750000000
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    first=$reply[3]
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    second=$reply[3]
+    assert "$first" different_to "$second"
+    git -C "$COOLDOWN_LOCAL" update-ref -d "$first"
+    assert "$(git -C "$COOLDOWN_LOCAL" rev-parse "$second")" same_as $REPLY
+    cooldown_release
+}
+
+@test 'Git cooldown defers incomplete shallow sources instead of reporting current' {
+    local REPLY expected
+    local -a reply
+    cooldown_fixture
+    cooldown_commit eligible 1750000000
+    expected=$REPLY
+    git clone --quiet --bare --depth=1 "file://$COOLDOWN_REMOTE" "$COOLDOWN_FIXTURE_DIR/shallow-source.git"
+    git -C "$COOLDOWN_LOCAL" remote set-url origin "$COOLDOWN_FIXTURE_DIR/shallow-source.git"
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as history
+    cooldown_assert_no_refs
+    git -C "$COOLDOWN_LOCAL" remote set-url origin "$COOLDOWN_REMOTE"
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as ready
+    assert $reply[2] same_as $expected
+    cooldown_release
+}
+
+@test 'Git cooldown ignores unrelated shallow boundaries when classifying history' {
+    local REPLY orphan divergent
+    local -a reply
+    cooldown_fixture
+    cooldown_commit eligible 1750000000
+    divergent=$(git -C "$COOLDOWN_LOCAL" -c commit.gpgsign=false commit-tree 'HEAD^{tree}' -p HEAD -m local)
+    git -C "$COOLDOWN_LOCAL" update-ref refs/heads/main "$divergent"
+    orphan=$(git -C "$COOLDOWN_REMOTE" -c commit.gpgsign=false commit-tree 'HEAD^{tree}' -m orphan)
+    git -C "$COOLDOWN_REMOTE" update-ref refs/heads/unrelated "$orphan"
+    git -C "$COOLDOWN_LOCAL" fetch --quiet --depth=1 origin refs/heads/unrelated:refs/remotes/origin/unrelated
+    cooldown_select main >/dev/null
+    assert $COOLDOWN_RC equals 1
+    cooldown_assert_no_refs
+    cooldown_select main 1600000000
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as age
+    cooldown_assert_no_refs
+}
+
+@test 'Git cooldown machine output ignores signature and notes display settings' {
+    (( ${+commands[ssh-keygen]} )) || skip 'SSH signing needs ssh-keygen'
+    local REPLY expected
+    local -a reply
+    cooldown_fixture
+    cooldown_commit eligible 1750000000
+    ssh-keygen -q -t ed25519 -N '' -f "$COOLDOWN_FIXTURE_DIR/signing"
+    GIT_COMMITTER_DATE='@1750000000 +0000' git -C "$COOLDOWN_REMOTE" -c gpg.format=ssh \
+        -c user.signingkey="$COOLDOWN_FIXTURE_DIR/signing" commit --quiet --amend --no-edit -S
+    expected=$(git -C "$COOLDOWN_REMOTE" rev-parse HEAD)
+    git -C "$COOLDOWN_LOCAL" config log.showSignature true
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[2] same_as $expected
+    cooldown_release
+    git -C "$COOLDOWN_LOCAL" notes add -m 'nonnumeric display text' "$expected"
+    git -C "$COOLDOWN_LOCAL" config log.showNotes true
+    cooldown_select "$expected"
+    assert $COOLDOWN_RC equals 0
+    assert $reply[2] same_as $expected
+    cooldown_release
+}
+
+@test 'Git cooldown uses original objects without changing local replacement settings' {
+    local GIT_NO_REPLACE_OBJECTS=''
+    unset GIT_NO_REPLACE_OBJECTS
+    local REPLY eligible recent replacement
+    local -a reply
+    cooldown_fixture
+    cooldown_commit eligible 1750000000
+    eligible=$REPLY
+    cooldown_commit recent 1900000000
+    recent=$REPLY
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[2] same_as $eligible
+    cooldown_release
+    replacement=$(GIT_AUTHOR_DATE='@1600000000 +0000' GIT_COMMITTER_DATE='@1600000000 +0000' \
+        git -C "$COOLDOWN_LOCAL" -c commit.gpgsign=false commit-tree "$recent^{tree}" -p "$eligible" -m replacement)
+    git -C "$COOLDOWN_LOCAL" replace "$recent" "$replacement"
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[2] same_as $eligible
+    cooldown_release
+    cooldown_select "$recent"
+    assert $COOLDOWN_RC equals 0
+    assert $reply[1] same_as deferred
+    assert $reply[4] same_as age
+    cooldown_assert_no_refs
+    assert ${+GIT_NO_REPLACE_OBJECTS} equals 0
+    assert "$(git -C "$COOLDOWN_LOCAL" show -s --format=%ct "$recent")" same_as 1600000000
+}
+
+@test 'Git cooldown ignores local grafts and preserves graft files and settings' {
+    local GIT_GRAFT_FILE=''
+    unset GIT_GRAFT_FILE
+    local REPLY eligible recent local_commit graft
+    local -a reply
+    cooldown_fixture
+    cooldown_commit eligible 1750000000
+    eligible=$REPLY
+    cooldown_commit recent 1900000000
+    recent=$REPLY
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    cooldown_release
+    local_commit=$(GIT_AUTHOR_DATE='@1600000000 +0000' GIT_COMMITTER_DATE='@1600000000 +0000' \
+        git -C "$COOLDOWN_LOCAL" -c commit.gpgsign=false commit-tree 'HEAD^{tree}' -p HEAD -m local-graft)
+    graft="$recent $local_commit"
+    git -C "$COOLDOWN_LOCAL" config advice.graftFileDeprecated false
+    print -r -- "$graft" > "$COOLDOWN_LOCAL/.git/info/grafts"
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[2] same_as $eligible
+    cooldown_release
+    assert ${+GIT_GRAFT_FILE} equals 0
+    assert "$(<$COOLDOWN_LOCAL/.git/info/grafts)" same_as "$graft"
+    export GIT_GRAFT_FILE="$COOLDOWN_FIXTURE_DIR/custom-grafts"
+    print -r -- "$graft" > "$GIT_GRAFT_FILE"
+    cooldown_select main
+    assert $COOLDOWN_RC equals 0
+    assert $reply[2] same_as $eligible
+    cooldown_release
+    assert "$GIT_GRAFT_FILE" same_as "$COOLDOWN_FIXTURE_DIR/custom-grafts"
+    assert "$(git -C "$COOLDOWN_LOCAL" rev-list --parents -1 "$recent")" same_as "$graft"
 }

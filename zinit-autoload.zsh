@@ -1972,6 +1972,169 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
     +zi-log "{error}Invalid update cooldown: expected an integer from 0 to 36500 days.{rst}"
     return 1
 } # ]]]
+# FUNCTION: .zinit-git-has-shallow-history [[[
+# Return 0 for reachable shallow boundaries, 1 for complete history, 2 on error.
+# $1 - repository; remaining arguments are revisions/options for rev-list.
+.zinit-git-has-shallow-history() {
+    builtin emulate -LR zsh ${=${options[xtrace]:#off}:+-o xtrace}
+    local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=''
+    local repo=$1 shallow_path boundaries roots root
+    shift
+    shallow_path=$(command git -C "$repo" rev-parse --git-path shallow) || return 2
+    [[ $shallow_path = /* ]] || shallow_path="$repo/$shallow_path"
+    [[ -s $shallow_path ]] || return 1
+    boundaries=$(<$shallow_path) || return 2
+    roots=$(command git -C "$repo" rev-list --max-parents=0 "$@") || return 2
+    for root in "${(@f)roots}"; do
+        [[ $'\n'$boundaries$'\n' = *$'\n'$root$'\n'* ]] && return 0
+    done
+    return 1
+} # ]]]
+# FUNCTION: .zinit-select-update-target [[[
+# Select a Git revision for a positive cooldown without changing the checkout.
+# $1 - repository, $2 - remote, $3 - branch/tag/full commit ID, $4 - cutoff epoch.
+# reply = (ready|current|deferred commit private-ref age|history|'').
+# On `ready', the caller owns private-ref and must delete it after applying the
+# selected commit. Other outcomes and errors clean it up here. Errors return 1;
+# a cooldown or an inconclusive shallow history is a successful deferral.
+# Deepening is limited to three requests (128, 512, then 2048 generations).
+.zinit-select-update-target() {
+    builtin emulate -LR zsh ${=${options[xtrace]:#off}:+-o xtrace}
+    setopt extendedglob typesetsilent warncreateglobal noshortloops
+    # Local replacements and grafts must not change fetched dates or ancestry.
+    # An empty graft filename also avoids Git's warning for an empty graft file.
+    local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=''
+
+    local repo=$1 remote=$2 requested=$3 cutoff=$4
+    local source kind head tip target history entry refs name scratch private_ref reservation timestamp
+    local -a deepen=( 0 128 512 2048 )
+    integer depth ancestor_rc history_rc
+    reply=( error '' '' '' )
+
+    # The cutoff is computed by the caller. Bound it before arithmetic anyway.
+    if [[ $cutoff != (|-)[0-9]## || ${#cutoff} -gt 12 || -z $remote || -z $requested ]]; then
+        +zi-log "{error}Invalid Git cooldown selection arguments.{rst}"
+        return 1
+    fi
+    head=$(command git -C "$repo" rev-parse --verify 'HEAD^{commit}') || return 1
+
+    case $requested in
+        (refs/heads/*) source=$requested; kind=branch ;;
+        (refs/tags/*) source=$requested; kind=pin ;;
+        ([[:xdigit:]](#c40)|[[:xdigit:]](#c64)) source=$requested; kind=pin ;;
+        (*)
+            command git check-ref-format "refs/heads/$requested" || return 1
+            refs=$(command git -C "$repo" ls-remote --refs -- "$remote" \
+                "refs/heads/$requested" "refs/tags/$requested") || return 1
+            for entry in "${(@f)refs}"; do
+                name=${entry#*$'\t'}
+                [[ $name = "refs/heads/$requested" || $name = "refs/tags/$requested" ]] || continue
+                if [[ -n $source ]]; then
+                    +zi-log "{error}Ambiguous Git revision {obj}$requested{error}; use refs/heads/ or refs/tags/.{rst}"
+                    return 1
+                fi
+                source=$name
+            done
+            if [[ -z $source ]]; then
+                +zi-log "{error}Git revision {obj}$requested{error} is not a remote branch or tag; use a full commit ID for a pin.{rst}"
+                return 1
+            fi
+            [[ $source = refs/heads/* ]] && kind=branch || kind=pin
+            ;;
+    esac
+    [[ $source != refs/* ]] || command git check-ref-format "$source" || return 1
+
+    scratch=$(command mktemp -d "${TMPDIR:-/tmp}/zinit-update.XXXXXXXX") || return 1
+    private_ref="refs/zinit/update/${scratch:t}"
+    command rmdir "$scratch" || return 1
+    # A non-commit reservation cannot masquerade as a fetched commit if Git
+    # refuses a ref update but returns success (e.g. with a shallow source).
+    reservation=$(command git -C "$repo" rev-parse --verify "$head^{tree}") || return 1
+    command git -C "$repo" update-ref "$private_ref" "$reservation" '' || return 1
+    {
+        # Do not fetch dependencies of an ineligible tip or update tracking refs.
+        command git -C "$repo" fetch --quiet --no-tags --recurse-submodules=no --refmap= --update-shallow \
+            -- "$remote" "+$source:$private_ref" || return 1
+        tip=$(command git -C "$repo" rev-parse --verify "$private_ref^{commit}") || return 1
+        if [[ $source != refs/* && $tip != ${(L)source} ]]; then
+            +zi-log "{error}Fetched Git commit does not match the requested pin.{rst}"
+            return 1
+        fi
+
+        for depth in "${deepen[@]}"; do
+            if (( depth )); then
+                # Keep the original tip, even if the remote branch moves meanwhile.
+                command git -C "$repo" fetch --quiet --no-tags --recurse-submodules=no --refmap= --update-shallow \
+                    --deepen=$depth -- "$remote" "+$tip:$private_ref" || return 1
+            fi
+            target=
+            if [[ $kind = pin ]]; then
+                history=$(command git -C "$repo" log --no-show-signature --no-notes --no-decorate \
+                    --no-color -1 --format='%H %ct' "$tip") || return 1
+            else
+                # --before can stop early on non-monotonic commit timestamps.
+                history=$(command git -C "$repo" log --no-show-signature --no-notes --no-decorate \
+                    --no-color --first-parent --format='%H %ct' "$tip") || return 1
+            fi
+            for entry in "${(@f)history}"; do
+                timestamp=${entry#* }
+                if [[ $entry != ([[:xdigit:]](#c40)|[[:xdigit:]](#c64))' '(|-)[0-9]## || ${#timestamp} -gt 12 ]]; then
+                    +zi-log "{error}Invalid Git commit timestamp received during cooldown selection.{rst}"
+                    return 1
+                fi
+                if (( timestamp <= cutoff )); then
+                    target=${entry%% *}
+                    break
+                fi
+            done
+            if [[ -z $target ]]; then
+                if [[ $kind = branch ]]; then
+                    .zinit-git-has-shallow-history "$repo" --first-parent "$tip"
+                    history_rc=$?
+                    if (( history_rc == 0 )); then
+                        reply=( deferred '' '' history )
+                        continue
+                    elif (( history_rc != 1 )); then
+                        return 1
+                    fi
+                fi
+                reply=( deferred '' '' age )
+                return 0
+            fi
+
+            command git -C "$repo" merge-base --is-ancestor "$target" "$head"
+            ancestor_rc=$?
+            if (( ancestor_rc == 0 )); then
+                reply=( current "$target" '' '' )
+                return 0
+            elif (( ancestor_rc != 1 )); then
+                return 1
+            fi
+            command git -C "$repo" merge-base --is-ancestor "$head" "$target"
+            ancestor_rc=$?
+            if (( ancestor_rc == 0 )); then
+                reply=( ready "$target" "$private_ref" '' )
+                return 0
+            elif (( ancestor_rc != 1 )); then
+                return 1
+            fi
+            .zinit-git-has-shallow-history "$repo" "$head" "$target"
+            history_rc=$?
+            if (( history_rc == 1 )); then
+                +zi-log "{error}Git cooldown target diverges from HEAD; cannot fast-forward.{rst}"
+                return 1
+            elif (( history_rc != 0 )); then
+                return 1
+            fi
+            reply=( deferred '' '' history )
+        done
+        return 0
+    } always {
+        if [[ $reply[1] != ready ]]; then
+            command git -C "$repo" update-ref -d "$private_ref" || return 1
+        fi
+    }
+} # ]]]
 # FUNCTION: .zi-check-for-git-changes [[[
 # Check for Git updates
 #

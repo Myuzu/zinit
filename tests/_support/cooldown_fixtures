@@ -1,0 +1,42 @@
+#!/usr/bin/env zsh
+
+# Local Git fixtures with fixed committer dates; no network or clock dependency.
+cooldown_fixture() {
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+    export GIT_AUTHOR_NAME=zunit GIT_AUTHOR_EMAIL=zunit@localhost
+    export GIT_COMMITTER_NAME=zunit GIT_COMMITTER_EMAIL=zunit@localhost
+    typeset -g COOLDOWN_FIXTURE_DIR COOLDOWN_REMOTE COOLDOWN_LOCAL COOLDOWN_BASE
+    COOLDOWN_FIXTURE_DIR=$(command mktemp -d "${ZINIT[HOME_DIR]}/cooldown-git.XXXXXXXX") || return 1
+    COOLDOWN_REMOTE=$COOLDOWN_FIXTURE_DIR/remote
+    COOLDOWN_LOCAL=$COOLDOWN_FIXTURE_DIR/local
+    command git -c init.defaultBranch=main init --quiet "$COOLDOWN_REMOTE" || return 1
+    cooldown_commit base 1700000000 || return 1
+    COOLDOWN_BASE=$REPLY
+    command git clone --quiet --no-hardlinks "$COOLDOWN_REMOTE" "$COOLDOWN_LOCAL"
+}
+
+# Append a real tree change. $3 optionally supplies an independent author date.
+cooldown_commit() {
+    builtin print -r -- "$1" >! "$COOLDOWN_REMOTE/content" || return 1
+    command git -C "$COOLDOWN_REMOTE" add content || return 1
+    GIT_AUTHOR_DATE="@${3:-$2} +0000" GIT_COMMITTER_DATE="@$2 +0000" \
+        command git -C "$COOLDOWN_REMOTE" -c commit.gpgsign=false commit --quiet -m "$1" || return 1
+    REPLY=$(command git -C "$COOLDOWN_REMOTE" rev-parse HEAD)
+}
+
+# Invoke in this shell so reply survives, while accommodating Zunit's errexit.
+cooldown_select() {
+    typeset -g COOLDOWN_RC=0
+    .zinit-select-update-target "$COOLDOWN_LOCAL" origin "$1" "${2:-1800000000}" || COOLDOWN_RC=$?
+}
+
+cooldown_assert_no_refs() {
+    local refs
+    refs=$(command git -C "$COOLDOWN_LOCAL" for-each-ref --format='%(refname)' refs/zinit/update/)
+    assert "$refs" is_empty
+}
+
+cooldown_release() {
+    command git -C "$COOLDOWN_LOCAL" update-ref -d "$reply[3]"
+    cooldown_assert_no_refs
+}
