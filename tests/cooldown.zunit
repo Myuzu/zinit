@@ -6,6 +6,441 @@
     load "${PWD}/tests/_support/cooldown_fixtures"
 }
 
+@test 'observations retain reachable ages and restart removed commits on reappearance' {
+    local -a reply
+    local -A ages
+    cooldown_observation_fixture
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 0
+    # Time before fetching does not count as observation of the fetched code.
+    COOLDOWN_STORE_NOW=1800000010
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 0
+    COOLDOWN_STORE_NOW=1800000100
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_B" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_B"
+    assert $COOLDOWN_STORE_RC equals 0
+    ages=( "${(@)reply[5,-1]}" )
+    assert $ages[$COOLDOWN_STORE_A] same_as 1800000010
+    assert $ages[$COOLDOWN_STORE_B] same_as 1800000100
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" -
+    assert $COOLDOWN_STORE_RC equals 0
+    assert ${#reply} equals 4
+    COOLDOWN_STORE_NOW=1800000200
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 0
+    assert $reply[6] same_as 1800000200
+    run test ! -e "$COOLDOWN_STORE_SCOPE"
+    assert $state equals 0
+}
+
+@test 'stale observations cannot restore removed ages or erase moved tag warnings' {
+    local -a reply
+    local stale
+    cooldown_observation_fixture
+    COOLDOWN_STORE_REF=refs/tags/v1
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    cooldown_observe begin
+    stale=$reply[1]
+    # A newer check observes both retargeting and removal of the old commit.
+    COOLDOWN_STORE_NOW=1800000100
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_B" "$COOLDOWN_STORE_B"
+    assert $COOLDOWN_STORE_RC equals 2
+    assert ${#reply} equals 0
+    cooldown_observe publish "$stale" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 2
+    assert ${#reply} equals 0
+    cooldown_observe begin
+    assert $reply[3] same_as "$COOLDOWN_STORE_B"
+    assert $reply[4] same_as 1
+    # Conflicting snapshots may discard age, but may never restore old credit.
+    assert ${#reply} equals 4
+    cooldown_observe publish "$reply[1]" -
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $reply[4] same_as 1
+}
+
+@test 'stale negative evidence still records transient tag movement and disappearance' {
+    local -a reply
+    local stale
+    cooldown_observation_fixture
+    COOLDOWN_STORE_REF=refs/tags/v1
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    cooldown_observe begin
+    stale=$reply[1]
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    cooldown_observe publish "$stale" "$COOLDOWN_STORE_B" "$COOLDOWN_STORE_B"
+    assert $COOLDOWN_STORE_RC equals 2
+    assert ${#reply} equals 0
+    cooldown_observe begin
+    assert $reply[3] same_as "$COOLDOWN_STORE_A"
+    assert $reply[4] same_as 1
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    cooldown_observe begin
+    stale=$reply[1]
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    cooldown_observe publish "$stale" -
+    assert $COOLDOWN_STORE_RC equals 2
+    cooldown_observe begin
+    assert $reply[4] same_as 1
+    assert ${#reply} equals 4
+}
+
+@test 'concurrent publication consumes an observation token only once' {
+    local -a reply results
+    local token one two
+    cooldown_observation_fixture
+    cooldown_observe begin
+    token=$reply[1]
+    (
+        cooldown_observe publish "$token" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+        print -r -- "$COOLDOWN_STORE_RC" > "$COOLDOWN_STORE_DIR/one"
+    ) &
+    one=$!
+    (
+        cooldown_observe publish "$token" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+        print -r -- "$COOLDOWN_STORE_RC" > "$COOLDOWN_STORE_DIR/two"
+    ) &
+    two=$!
+    wait $one $two
+    results=( "$(<"$COOLDOWN_STORE_DIR/one")" "$(<"$COOLDOWN_STORE_DIR/two")" )
+    assert "${(j: :)${(o)results}}" same_as '0 2'
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 0
+    assert ${#reply} equals 6
+}
+
+@test 'overlapping checks preserve age after both publish their evidence and retry' {
+    local -a reply
+    local first second
+    cooldown_observation_fixture
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    COOLDOWN_STORE_NOW=1800100000
+    cooldown_observe begin
+    first=$reply[1]
+    cooldown_observe begin
+    second=$reply[1]
+    cooldown_observe publish "$second" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 2
+    assert ${#reply} equals 0
+    cooldown_observe publish "$first" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 2
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 0
+    assert $reply[6] same_as 1800000000
+}
+
+@test 'failed or interrupted publication cannot silently reuse age after writes recover' {
+    local -a reply original_path=( "${path[@]}" )
+    local REPLY mode original_home=${ZINIT[HOME_DIR]} pending
+    local -x COOLDOWN_STORE_FAILURE COOLDOWN_STORE_FAIL_FILE
+    for mode in prepare publish interrupted; do
+        local -a path=( "${original_path[@]}" )
+        ZINIT[HOME_DIR]=$original_home
+        cooldown_observation_fixture
+        COOLDOWN_STORE_REF=refs/tags/v1
+        cooldown_observation_fault_fixture
+        path=( "$COOLDOWN_STORE_DIR/shim" "${original_path[@]}" )
+        cooldown_observe begin
+        cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+        cooldown_observation_file
+        COOLDOWN_STORE_FAIL_FILE=$REPLY
+        COOLDOWN_STORE_NOW=1800100000
+        cooldown_observe begin
+        pending=$reply[1]
+        if [[ $mode != interrupted ]]; then
+            COOLDOWN_STORE_FAILURE=$mode
+            cooldown_observe publish "$pending" "$COOLDOWN_STORE_B" "$COOLDOWN_STORE_B"
+            assert $COOLDOWN_STORE_RC equals 1
+            assert ${#reply} equals 0
+            COOLDOWN_STORE_FAILURE=
+        fi
+        # Upstream returns to A after B was seen, or the observer was killed.
+        # Fresh successful writes cannot treat that unresolved check as safe.
+        cooldown_observe begin
+        cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+        assert $COOLDOWN_STORE_RC equals 2
+        assert ${#reply} equals 0
+        # The original observer can still save its evidence after a transient
+        # disk error. That consumes its token, but preserves the moved-tag latch.
+        cooldown_observe publish "$pending" "$COOLDOWN_STORE_B" "$COOLDOWN_STORE_B"
+        assert $COOLDOWN_STORE_RC equals 2
+        cooldown_observe begin
+        cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+        assert $COOLDOWN_STORE_RC equals 0
+        assert $reply[4] same_as 1
+        assert $reply[6] same_as 1800100000
+    done
+}
+
+@test 'custom shell word separators cannot erase an unresolved observation' {
+    local -a reply
+    local first second separator saved_ifs=$IFS
+    cooldown_observation_fixture
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    cooldown_observe begin
+    first=$reply[1]
+    for separator in ':' '' $'\n'; do
+        IFS=$separator
+        cooldown_observe begin
+        second=$reply[1]
+        assert $COOLDOWN_STORE_RC equals 0
+        IFS=$saved_ifs
+        cooldown_observe publish "$second" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+        assert $COOLDOWN_STORE_RC equals 2
+        assert ${#reply} equals 0
+    done
+    cooldown_observe publish "$first" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 2
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 0
+    assert $reply[6] same_as 1800000000
+}
+
+@test 'failed global clock persistence holds every binding after the clock recovers' {
+    local -a reply
+    local -x COOLDOWN_STORE_FAILURE COOLDOWN_STORE_FAIL_CLOCK
+    local source_original token
+    cooldown_observation_fixture
+    cooldown_observation_fault_fixture
+    local -a path=( "$COOLDOWN_STORE_DIR/shim" "${path[@]}" )
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    source_original=$COOLDOWN_STORE_SOURCE
+    COOLDOWN_STORE_SOURCE+=-other
+    COOLDOWN_STORE_NOW=1800100000
+    cooldown_observe begin
+    token=$reply[1]
+    COOLDOWN_STORE_NOW=1700000000
+    COOLDOWN_STORE_FAILURE=clock
+    COOLDOWN_STORE_FAIL_CLOCK=${ZINIT[HOME_DIR]}/update-cooldown/clock
+    cooldown_observe publish "$token" "$COOLDOWN_STORE_B" "$COOLDOWN_STORE_B"
+    assert $COOLDOWN_STORE_RC equals 1
+    assert ${#reply} equals 0
+    COOLDOWN_STORE_FAILURE=
+    COOLDOWN_STORE_NOW=1800100000
+    COOLDOWN_STORE_SOURCE=$source_original
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 1
+    assert ${#reply} equals 0
+    assert "${ZINIT[HOME_DIR]}/update-cooldown/clock-pending" is_dir
+}
+
+@test 'observable clock rollback cannot manufacture mature observations' {
+    local -a reply
+    cooldown_observation_fixture
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    COOLDOWN_STORE_NOW=1800100000
+    cooldown_observe begin
+    # Roll back during the upstream request, then restore the original clock.
+    COOLDOWN_STORE_NOW=1700000000
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_B" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_B"
+    assert $COOLDOWN_STORE_RC equals 0
+    assert $reply[2] same_as 1800100000
+    assert $reply[6] same_as 1800100000
+    assert $reply[8] same_as 1800100000
+    COOLDOWN_STORE_NOW=1800100000
+    cooldown_observe begin
+    assert $reply[6] same_as 1800100000
+    assert $reply[8] same_as 1800100000
+    COOLDOWN_STORE_NOW=1690000000
+    cooldown_observe begin
+    assert $reply[2] same_as 1800100000
+    assert $reply[6] same_as 1800100000
+}
+
+@test 'source ref and checkout identities cannot borrow another binding age' {
+    local -a reply
+    local field original
+    cooldown_observation_fixture
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    COOLDOWN_STORE_NOW=1800100000
+    for field in COOLDOWN_STORE_SOURCE COOLDOWN_STORE_REF COOLDOWN_STORE_SCOPE; do
+        original=${(P)field}
+        typeset -g "$field=$original-changed"
+        cooldown_observe begin
+        assert ${#reply} equals 4
+        cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+        assert $COOLDOWN_STORE_RC equals 0
+        assert $reply[6] same_as 1800100000
+        typeset -g "$field=$original"
+    done
+}
+
+@test 'new bindings share clock rollback protection and cannot replace a missing clock' {
+    local -a reply
+    local clock_file
+    cooldown_observation_fixture
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    COOLDOWN_STORE_NOW=1800100000
+    COOLDOWN_STORE_SOURCE+=-new
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    COOLDOWN_STORE_NOW=1700000000
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 0
+    assert $reply[6] same_as 1800100000
+    COOLDOWN_STORE_NOW=1800100000
+    cooldown_observe begin
+    assert $reply[6] same_as 1800100000
+    # An older binding that slept through the rollback must honor the reset too.
+    COOLDOWN_STORE_SOURCE=${COOLDOWN_STORE_SOURCE%-new}
+    cooldown_observe begin
+    assert $reply[6] same_as 1800100000
+    clock_file=${ZINIT[HOME_DIR]}/update-cooldown/clock
+    mv "$clock_file" "$COOLDOWN_STORE_DIR/saved-clock"
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 1
+    assert ${#reply} equals 0
+    mv "$COOLDOWN_STORE_DIR/saved-clock" "$clock_file"
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 0
+}
+
+@test 'observation metadata is inert and corrupt or unknown state grants no age' {
+    local -a reply lines original
+    local REPLY file value
+    cooldown_observation_fixture
+    COOLDOWN_STORE_SOURCE=$'ssh://example/quoted\n"$(touch should-not-exist)"'
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    cooldown_observation_file
+    file=$REPLY
+    original=( "${(@f)$(<"$file")}" )
+    for value in '1+2' '-1' '01' '99999999999999999999999' '$((x=1))'; do
+        lines=( "${(@)original[1,-2]}" )
+        lines[8]="$COOLDOWN_STORE_A $value"
+        cooldown_observation_write "$file" "${lines[@]}"
+        cooldown_observe begin
+        assert $COOLDOWN_STORE_RC equals 1
+        assert ${#reply} equals 0
+    done
+    # A well-formed but edited timestamp must also fail its original checksum.
+    lines=( "${original[@]}" )
+    lines[8]="$COOLDOWN_STORE_A 1"
+    print -rl -- "${lines[@]}" >! "$file"
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 1
+    lines=( "${(@)original[1,-2]}" )
+    lines[1]=zinit-cooldown-v2
+    cooldown_observation_write "$file" "${lines[@]}"
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 1
+    # Restore the valid control and prove hostile-looking identity is just data.
+    print -rl -- "${original[@]}" >! "$file"
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 0
+    assert $reply[6] same_as 1800000000
+    run test ! -e should-not-exist
+    assert $state equals 0
+}
+
+@test 'missing state invalidates pending publication and starts new observations cold' {
+    local -a reply
+    local REPLY file token
+    cooldown_observation_fixture
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    cooldown_observe begin
+    token=$reply[1]
+    cooldown_observation_file
+    file=$REPLY
+    mv "$file" "$COOLDOWN_STORE_DIR/saved"
+    cooldown_observe publish "$token" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 2
+    assert ${#reply} equals 0
+    COOLDOWN_STORE_NOW=1800100000
+    cooldown_observe begin
+    cooldown_observe publish "$reply[1]" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $reply[6] same_as 1800100000
+    cooldown_observe publish "$token" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 2
+}
+
+@test 'unsafe observation paths and unavailable writes return no trusted state' {
+    local -a reply
+    local REPLY file saved_home
+    cooldown_observation_fixture
+    cooldown_observe begin
+    cooldown_observation_file
+    file=$REPLY
+    mv "$file" "$COOLDOWN_STORE_DIR/saved"
+    ln -s "$COOLDOWN_STORE_DIR/saved" "$file"
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 1
+    assert ${#reply} equals 0
+    mv "$file" "$COOLDOWN_STORE_DIR/link"
+    mv "$COOLDOWN_STORE_DIR/saved" "$file"
+    chmod 400 "$file"
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 1
+    assert ${#reply} equals 0
+    chmod 600 "$file"
+    saved_home=${ZINIT[HOME_DIR]}
+    ZINIT[HOME_DIR]=$COOLDOWN_STORE_SCOPE
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 1
+    ZINIT[HOME_DIR]=$saved_home
+    chmod 500 "${ZINIT[HOME_DIR]}/update-cooldown"
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 1
+    assert ${#reply} equals 0
+    chmod 700 "${ZINIT[HOME_DIR]}/update-cooldown"
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 0
+}
+
+@test 'observation limits and lock contention fail closed without consuming valid state' {
+    local -a reply oversized
+    local token index lock_fd REPLY file original
+    cooldown_observation_fixture
+    cooldown_observe begin
+    token=$reply[1]
+    cooldown_observe publish "$token" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 1
+    for (( index=0; index<10001; ++index )); do
+        oversized+=( "$COOLDOWN_STORE_A" )
+    done
+    cooldown_observe publish "$token" "$COOLDOWN_STORE_A" "${oversized[@]}"
+    assert $COOLDOWN_STORE_RC equals 1
+    assert ${#reply} equals 0
+    cooldown_observe publish "$token" "$COOLDOWN_STORE_A" "$COOLDOWN_STORE_A"
+    assert $COOLDOWN_STORE_RC equals 0
+    zsystem flock -f lock_fd "${ZINIT[HOME_DIR]}/update-cooldown/lock"
+    run .zinit-cooldown-observation begin "$COOLDOWN_STORE_SCOPE" "$COOLDOWN_STORE_SOURCE" "$COOLDOWN_STORE_REF"
+    assert $state equals 1
+    zsystem flock -u $lock_fd
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 0
+    assert $reply[6] same_as 1800000000
+    cooldown_observation_file
+    file=$REPLY
+    original=$(<"$file")
+    command dd if=/dev/zero bs=1024 count=1025 >! "$file" 2>/dev/null
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 1
+    assert ${#reply} equals 0
+    print -r -- "$original" >! "$file"
+    cooldown_observe begin
+    assert $COOLDOWN_STORE_RC equals 0
+}
+
 @test 'cooldown validates decimal days before arithmetic' {
     local REPLY value normalized rc
     for value normalized in 0 0 000 0 08 8 00010 10 36500 36500; do

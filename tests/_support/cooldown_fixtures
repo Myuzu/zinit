@@ -40,3 +40,61 @@ cooldown_release() {
     command git -C "$COOLDOWN_LOCAL" update-ref -d "$reply[3]"
     cooldown_assert_no_refs
 }
+
+# Storage tests use an internal clock helper, never a user-facing override.
+cooldown_observation_fixture() {
+    typeset -g COOLDOWN_STORE_DIR COOLDOWN_STORE_SCOPE COOLDOWN_STORE_SOURCE
+    typeset -g COOLDOWN_STORE_REF=refs/heads/main COOLDOWN_STORE_NOW=1800000000
+    typeset -g COOLDOWN_STORE_A=${(l:40::a:)} COOLDOWN_STORE_B=${(l:40::b:)}
+    COOLDOWN_STORE_DIR=$(command mktemp -d "${ZINIT[HOME_DIR]}/cooldown-store.XXXXXXXX") || return 1
+    COOLDOWN_STORE_SCOPE=$COOLDOWN_STORE_DIR/checkout
+    COOLDOWN_STORE_SOURCE=https://example.invalid/plugin.git
+    ZINIT[HOME_DIR]=$COOLDOWN_STORE_DIR/home
+    .zinit-cooldown-now() { REPLY=$COOLDOWN_STORE_NOW; }
+}
+
+cooldown_observe() {
+    typeset -g COOLDOWN_STORE_RC=0
+    .zinit-cooldown-observation "$1" "$COOLDOWN_STORE_SCOPE" "$COOLDOWN_STORE_SOURCE" \
+        "$COOLDOWN_STORE_REF" "${@:2}" || COOLDOWN_STORE_RC=$?
+}
+
+# Return the only state file in a fresh fixture, excluding its permanent lock.
+cooldown_observation_file() {
+    local -a files=( "${ZINIT[HOME_DIR]}/update-cooldown"/[0-9a-f]##(N.) )
+    (( ${#files} == 1 )) || return 1
+    REPLY=$files[1]
+}
+
+# Deliberately construct checksummed malformed data to test validation after
+# integrity checking as well as accidental corruption without a new checksum.
+cooldown_observation_write() {
+    local file=$1 checksum
+    shift
+    checksum=$(builtin print -rl -- "$@" | command git -C "${file:h}" hash-object --stdin) || return 1
+    builtin print -rl -- "$@" "checksum $checksum" >! "$file"
+}
+
+# Fail either before preparing new state or at its atomic publication. Existing
+# state and the clock remain real files; clearing the flag restores real tools.
+cooldown_observation_fault_fixture() {
+    command mkdir "$COOLDOWN_STORE_DIR/shim" || return 1
+    export COOLDOWN_STORE_REAL_MKTEMP=${commands[mktemp]}
+    command cat > "$COOLDOWN_STORE_DIR/shim/mktemp" <<'EOF'
+#!/bin/sh
+[ "$COOLDOWN_STORE_FAILURE" != prepare ] || exit 73
+exec "$COOLDOWN_STORE_REAL_MKTEMP" "$@"
+EOF
+    command cat > "$COOLDOWN_STORE_DIR/shim/mv" <<'EOF'
+#!/bin/sh
+for destination do :; done
+if [ "$COOLDOWN_STORE_FAILURE" = publish ] && [ "$destination" = "$COOLDOWN_STORE_FAIL_FILE" ]; then
+    exit 73
+fi
+if [ "$COOLDOWN_STORE_FAILURE" = clock ] && [ "$destination" = "$COOLDOWN_STORE_FAIL_CLOCK" ]; then
+    exit 73
+fi
+exec /bin/mv "$@"
+EOF
+    command chmod 700 "$COOLDOWN_STORE_DIR/shim/"{mktemp,mv}
+}

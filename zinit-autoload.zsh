@@ -1972,6 +1972,238 @@ print -- "\nAvailable ice-modifiers:\n\n${ice_order[*]}"
     +zi-log "{error}Invalid update cooldown: expected an integer from 0 to 36500 days.{rst}"
     return 1
 } # ]]]
+# FUNCTION: .zinit-cooldown-now [[[
+# Separate the local clock from observation storage so tests need no public
+# clock override. Neither remote dates nor file mtimes establish first-seen age.
+.zinit-cooldown-now() {
+    zmodload zsh/datetime || return 1
+    REPLY=$EPOCHSECONDS
+} # ]]]
+# FUNCTION: .zinit-cooldown-observation [[[
+# Store trusted local observations outside the downloaded working tree.
+# $1: begin|publish; $2: absolute checkout path; $3: effective source URL;
+# $4: fully qualified ref or full pin. These three fields identify a binding.
+# publish additionally takes $5: begin token, $6: advertised object ID (or -
+# for confirmed absence), then the complete set of observed commit IDs.
+# Call begin BEFORE querying upstream. Publish only a verified snapshot, never
+# cached objects or a failed request. Omitted commits lose their recorded age.
+# reply = (token clock-high-water tag-object moved-tag [commit first-seen]...).
+# Return 2 for a stale token (retry observation), 1 for unavailable/invalid
+# storage. All failures clear reply; callers must hold updates on either error.
+# Begin records a pending token before upstream is contacted. Publish consumes
+# it atomically with the evidence; while other tokens remain, return 2 with no
+# admission data. Interrupted/failed checks remain held until explicit recovery.
+# Recovery must discard age credit and retain uncertainty about existing tags.
+# Only a successful publish supplies admission data; begin's records are for
+# preparing an observation. Never use confirmed absence (-) as cancellation.
+#
+# Only metadata transactions are locked, never a fetch or an update. Every
+# transaction replaces the token, so an older observation cannot undo a newer
+# removal or moved-tag latch. The lock inode must never be replaced/unlinked.
+# A stale publication can only remove ages and latch tag movement; it still
+# requires a retry. Bound each binding to 10,000 commits and 1 MiB of metadata.
+# The local filesystem and clock are trusted. Observable clock rollback resets
+# ages to the previous high-water time, retaining moved-tag decisions. Unknown
+# or corrupt state grants no age. The checksum detects accidental corruption;
+# it is not authentication against an attacker who can write local state.
+.zinit-cooldown-observation() {
+    builtin emulate -LR zsh ${=${options[xtrace]:#off}:+-o xtrace}
+    setopt extendedglob typesetsilent warncreateglobal noshortloops
+    local -x LC_ALL=C
+    local action=$1 scope=$2 source=$3 selected=$4 expected=$5 advertised=$6
+    local root="${ZINIT[HOME_DIR]}/update-cooldown" binding key state lock_fd temporary
+    local checksum generation watermark=0 tag=- moved=0 entry oid seen now clock_watermark=0 clock_floor=0
+    local REPLY
+    local -a lines records files pending_tokens
+    local -A metadata ages observed pending
+    integer new_clock=0 stale=0
+    reply=()
+
+    [[ $action = begin || $action = publish ]] || return 1
+    [[ $scope = /* && -n $source && -n $selected && ${ZINIT[HOME_DIR]} = /* ]] || return 1
+    (( ${#scope} <= 4096 && ${#source} <= 4096 && ${#selected} <= 4096 )) || return 1
+    scope=${scope:A}
+    # A custom HOME_DIR must not put trusted state inside the checkout it gates.
+    [[ ${root:A} != "$scope" && ${root:A} != "$scope/"* && ! -L $root ]] || return 1
+    binding="${(qqqq)scope} ${(qqqq)source} ${(qqqq)selected}"
+    if [[ $action = begin ]]; then
+        (( $# == 4 )) || return 1
+    else
+        (( $# >= 6 && $# <= 10006 )) || return 1
+        [[ $expected = state.[a-zA-Z0-9](#c24) ]] || return 1
+        [[ $advertised = - || $advertised = ([0-9a-f](#c40)|[0-9a-f](#c64)) ]] || return 1
+        shift 6
+        [[ $advertised != - || $# = 0 ]] || return 1
+        for oid in "$@"; do
+            [[ $oid = ([0-9a-f](#c40)|[0-9a-f](#c64)) && ! -v observed[$oid] ]] || return 1
+            observed[$oid]=1
+        done
+    fi
+
+    zmodload zsh/system && zsystem supports flock && zmodload zsh/stat || return 1
+    command mkdir -p -m 700 -- "$root" || return 1
+    zstat -H metadata -- "$root" || return 1
+    (( metadata[uid] == EUID && (metadata[mode] & 8#777) == 8#700 )) || return 1
+    # Create once, without truncating or replacing a concurrently used lock.
+    if [[ ! -e $root/lock && ! -L $root/lock ]]; then
+        ( umask 077; setopt noclobber; : > "$root/lock" ) 2>/dev/null
+    fi
+    [[ -f $root/lock && ! -L $root/lock ]] || return 1
+    zstat -H metadata -- "$root/lock" || return 1
+    (( metadata[uid] == EUID && (metadata[mode] & 8#777) == 8#600 && metadata[nlink] == 1 )) || return 1
+    zsystem flock -t 1 -f lock_fd "$root/lock" || return 1
+    {
+        # This marker covers only the short clock transaction. If it survives a
+        # failed write/crash, no binding may reuse an uncertain global age floor.
+        [[ ! -e $root/clock-pending && ! -L $root/clock-pending ]] || return 1
+        # A rollback observed through one binding must also protect a newly
+        # added binding. Keep this high-water mark across all observation files.
+        if [[ -e $root/clock || -L $root/clock ]]; then
+            [[ -f $root/clock && ! -L $root/clock ]] || return 1
+            zstat -H metadata -- "$root/clock" || return 1
+            (( metadata[uid] == EUID && (metadata[mode] & 8#777) == 8#600 &&
+                metadata[nlink] == 1 && metadata[size] <= 256 )) || return 1
+            lines=( "${(@f)$(<"$root/clock")}" )
+            [[ ${#lines} = 4 && $lines[1] = zinit-cooldown-clock-v1 &&
+                $lines[2] = (0|[1-9][0-9]#) && ${#lines[2]} -le 12 &&
+                $lines[3] = (0|[1-9][0-9]#) && ${#lines[3]} -le 12 ]] || return 1
+            checksum=$(builtin print -rl -- "${(@)lines[1,3]}" | command git -C "$root" hash-object --stdin) || return 1
+            [[ $lines[4] = "checksum $checksum" ]] || return 1
+            clock_watermark=$lines[2] clock_floor=$lines[3]
+            (( clock_floor <= clock_watermark )) || return 1
+        else
+            # A missing clock is a cold start only when no other state exists.
+            files=( "$root"/*(N) )
+            [[ ${#files} = 1 && $files[1] = "$root/lock" ]] || return 1
+            new_clock=1
+        fi
+        key=$(builtin print -r -- "$binding" | command git -C "$root" hash-object --stdin) || return 1
+        [[ $key = ([0-9a-f](#c40)|[0-9a-f](#c64)) ]] || return 1
+        state="$root/$key"
+        if [[ -e $state || -L $state ]]; then
+            [[ -f $state && ! -L $state ]] || return 1
+            zstat -H metadata -- "$state" || return 1
+            (( metadata[uid] == EUID && (metadata[mode] & 8#777) == 8#600 &&
+                metadata[nlink] == 1 && metadata[size] <= 1048576 )) || return 1
+            lines=( "${(@f)$(<"$state")}" )
+            (( ${#lines} >= 8 && ${#lines} <= 10008 )) || return 1
+            [[ $lines[1] = zinit-cooldown-v1 && $lines[2] = "$binding" &&
+                $lines[3] = state.[a-zA-Z0-9](#c24) &&
+                $lines[4] = (0|[1-9][0-9]#) && ${#lines[4]} -le 12 &&
+                $lines[5] = (-|[0-9a-f](#c40)|[0-9a-f](#c64)) &&
+                $lines[6] = [01] && $lines[7] = pending(' 'state.[a-zA-Z0-9](#c24))# ]] || return 1
+            checksum=$(builtin print -rl -- "${(@)lines[1,-2]}" | command git -C "$root" hash-object --stdin) || return 1
+            [[ $lines[-1] = "checksum $checksum" ]] || return 1
+            generation=$lines[3] watermark=$lines[4] tag=$lines[5] moved=$lines[6]
+            (( watermark <= clock_watermark )) || return 1
+            if [[ $selected != refs/tags/* ]]; then
+                [[ $tag = - && $moved = 0 ]] || return 1
+            fi
+            pending_tokens=( "${(@s: :)lines[7]}" )
+            pending_tokens[1]=()
+            (( ${#pending_tokens} <= 128 )) || return 1
+            for entry in "${pending_tokens[@]}"; do
+                [[ ! -v pending[$entry] ]] || return 1
+                pending[$entry]=1
+            done
+            for entry in "${(@)lines[8,-2]}"; do
+                [[ $entry = ([0-9a-f](#c40)|[0-9a-f](#c64))' '(0|[1-9][0-9]#) ]] || return 1
+                oid=${entry%% *} seen=${entry#* }
+                [[ ${#seen} -le 12 && ! -v ages[$oid] ]] || return 1
+                (( seen <= watermark )) || return 1
+                ages[$oid]=$seen
+            done
+        else
+            # Do not silently create state for a publish whose begin disappeared.
+            [[ $action = begin ]] || return 2
+            files=( "$root"/*(N) )
+            (( ${#files} < 1024 )) || return 1
+        fi
+        if [[ $action = begin ]]; then
+            (( ${#pending} < 128 )) || return 1
+        else
+            [[ -v pending[$expected] ]] || return 2
+        fi
+        [[ $action != publish || $generation = "$expected" ]] || stale=1
+        command mkdir -m 700 -- "$root/clock-pending" || return 1
+        .zinit-cooldown-now || return 1
+        now=$REPLY
+        [[ $now = (0|[1-9][0-9]#) && ${#now} -le 12 ]] || return 1
+        if (( now < clock_watermark && clock_floor < clock_watermark )); then
+            # Persist a reset floor for dormant bindings too, including checks
+            # that resume only after the system clock has recovered.
+            clock_floor=$clock_watermark
+            new_clock=1
+        fi
+        watermark=$(( now > clock_watermark ? now : clock_watermark ))
+
+        if [[ $action = publish ]]; then
+            if [[ $selected = refs/tags/* && $advertised != - ]]; then
+                [[ $tag = - || $tag = "$advertised" ]] || moved=1
+                # Even an overlapping check's retarget evidence must survive a
+                # retry, but it must not replace a more recently recorded tag.
+                if (( ! stale )) || [[ $tag = - ]]; then
+                    tag=$advertised
+                fi
+            fi
+            # Absence removes age, but never forgets an existing tag binding or
+            # clears its manual-decision latch. Bypass does not erase history.
+            for oid in "${(@ok)observed}"; do
+                # Intersect stale evidence with current state: never resurrect
+                # an age, or forget an observed disappearance due to a retry.
+                (( ! stale )) || [[ -v ages[$oid] ]] || continue
+                seen=${ages[$oid]:-$watermark}
+                (( seen >= clock_floor )) || seen=$clock_floor
+                records+=( "$oid $seen" )
+            done
+        else
+            for oid in "${(@ok)ages}"; do
+                seen=$ages[$oid]
+                (( seen >= clock_floor )) || seen=$clock_floor
+                records+=( "$oid $seen" )
+            done
+        fi
+        if (( new_clock || watermark > clock_watermark )); then
+            # Persist the global clock first: a crash can lose age credit but
+            # cannot leave a binding newer than its store-wide high-water mark.
+            temporary=$(command mktemp "$root/state.XXXXXXXXXXXXXXXXXXXXXXXX") || return 1
+            lines=( zinit-cooldown-clock-v1 "$watermark" "$clock_floor" )
+            checksum=$(builtin print -rl -- "${lines[@]}" | command git -C "$root" hash-object --stdin) || return 1
+            builtin print -rl -- "${lines[@]}" "checksum $checksum" >! "$temporary" || return 1
+            command mv -f -- "$temporary" "$root/clock" || return 1
+            temporary=
+        fi
+        # Remove only after the clock is durable enough for the binding write.
+        # Unlike temporary payloads, an uncertain clock marker is never cleaned
+        # up in `always': recovery is an explicit decision, not an error retry.
+        command rmdir -- "$root/clock-pending" || return 1
+        temporary=$(command mktemp "$root/state.XXXXXXXXXXXXXXXXXXXXXXXX") || return 1
+        generation=${temporary:t}
+        if [[ $action = begin ]]; then
+            pending[$generation]=1
+        else
+            unset "pending[$expected]"
+        fi
+        pending_tokens=( "${(@ok)pending}" )
+        lines=( zinit-cooldown-v1 "$binding" "$generation" "$watermark" "$tag" "$moved"
+            "pending${pending_tokens:+ ${(j: :)pending_tokens}}" "${records[@]}" )
+        checksum=$(builtin print -rl -- "${lines[@]}" | command git -C "$root" hash-object --stdin) || return 1
+        builtin print -rl -- "${lines[@]}" "checksum $checksum" >! "$temporary" || return 1
+        command mv -f -- "$temporary" "$state" || return 1
+        temporary=
+        if [[ $action = publish ]] && (( stale || ${#pending} )); then
+            return 2
+        fi
+        reply=( "$generation" "$watermark" "$tag" "$moved" )
+        for entry in "${records[@]}"; do
+            reply+=( "${entry%% *}" "${entry#* }" )
+        done
+        return 0
+    } always {
+        [[ -z $temporary ]] || command rm -f -- "$temporary"
+        zsystem flock -u $lock_fd
+    }
+} # ]]]
 # FUNCTION: .zinit-git-has-shallow-history [[[
 # Return 0 for reachable shallow boundaries, 1 for complete history, 2 on error.
 # $1 - repository; remaining arguments are revisions/options for rev-list.
